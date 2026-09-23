@@ -1,4 +1,4 @@
-package meshnetserver
+package meshnet
 
 import (
 	"errors"
@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	meshnet "github.com/BARGHEST-ngo/MESHnet"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
@@ -35,7 +34,7 @@ func (f *fakeTailcat) Close() error {
 func newTestServer(t *testing.T) (*Server, *fakeTailcat) {
 	t.Helper()
 	fake := &fakeTailcat{}
-	s := New(Config{})
+	s := NewServer(ServerConfig{})
 	s.newTailcat = func([]key.NodePublic) tailcatServer {
 		return fake
 	}
@@ -84,8 +83,8 @@ func TestStartStop(t *testing.T) {
 		s, _ := newTestServer(t)
 		assertClosed(t, s.Done())
 
-		if !errors.Is(s.Err(), meshnet.ErrClosed) {
-			t.Errorf("expected %v, got %v", meshnet.ErrClosed, s.Err())
+		if !errors.Is(s.Err(), ErrClosed) {
+			t.Errorf("expected %v, got %v", ErrClosed, s.Err())
 		}
 	})
 
@@ -109,8 +108,8 @@ func TestStartStop(t *testing.T) {
 		}
 
 		assertClosed(t, s.Done())
-		if !errors.Is(s.Err(), meshnet.ErrClosed) {
-			t.Errorf("wanted %v, got %v", meshnet.ErrClosed, s.Err())
+		if !errors.Is(s.Err(), ErrClosed) {
+			t.Errorf("wanted %v, got %v", ErrClosed, s.Err())
 		}
 	})
 
@@ -120,8 +119,8 @@ func TestStartStop(t *testing.T) {
 			t.Fatalf("Start: %v", err)
 		}
 
-		if _, err := s.Start(); !errors.Is(err, meshnet.ErrAlreadyStarted) {
-			t.Errorf("wanted %v, got %v", meshnet.ErrAlreadyStarted, err)
+		if _, err := s.Start(); !errors.Is(err, ErrAlreadyStarted) {
+			t.Errorf("wanted %v, got %v", ErrAlreadyStarted, err)
 		}
 		assertOpen(t, s.Done())
 	})
@@ -202,8 +201,8 @@ func TestStartStop(t *testing.T) {
 			t.Errorf("Close called %d times, want 1", n)
 		}
 		assertClosed(t, s.Done())
-		if !errors.Is(s.Err(), meshnet.ErrClosed) {
-			t.Errorf("wanted %v, got %v", meshnet.ErrClosed, s.Err())
+		if !errors.Is(s.Err(), ErrClosed) {
+			t.Errorf("wanted %v, got %v", ErrClosed, s.Err())
 		}
 	})
 }

@@ -1,4 +1,4 @@
-package meshnetserver
+package meshnet
 
 import (
 	"fmt"
@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 
-	meshnet "github.com/BARGHEST-ngo/MESHnet"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
@@ -18,7 +17,7 @@ type tailcatServer interface {
 	TailcatAddr() tailcat.Addr
 }
 
-type Config struct {
+type ServerConfig struct {
 	AllowedClients []string
 	Logf           func(format string, args ...any)
 }
@@ -29,11 +28,11 @@ type Server struct {
 	done chan struct{}
 	err  error
 
-	cfg        Config
+	cfg        ServerConfig
 	newTailcat func([]key.NodePublic) tailcatServer
 }
 
-func New(cfg Config) *Server {
+func NewServer(cfg ServerConfig) *Server {
 	// nil Logf in tailcat pushes everything to log.Printf
 	// if nil is sent give it an empty func to discard everything
 	if cfg.Logf == nil {
@@ -45,7 +44,7 @@ func New(cfg Config) *Server {
 	close(done)
 	s := &Server{
 		done: done,
-		err:  meshnet.ErrClosed,
+		err:  ErrClosed,
 		cfg:  cfg,
 	}
 	s.newTailcat = s.buildTailcat
@@ -66,17 +65,17 @@ func (s *Server) Start() (addr string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.srv != nil {
-		return "", meshnet.ErrAlreadyStarted
+		return "", ErrAlreadyStarted
 	}
 
 	allowList, err := parseAllowedClients(s.cfg.AllowedClients)
 	if err != nil {
-		return "", fmt.Errorf("meshnetserver: start: %w", err)
+		return "", fmt.Errorf("server: start: %w", err)
 	}
 
 	srv := s.newTailcat(allowList)
 	if err := srv.Start(); err != nil {
-		return "", fmt.Errorf("meshnetserver: start: %w", err)
+		return "", fmt.Errorf("server: start: %w", err)
 	}
 
 	s.done = make(chan struct{})
@@ -96,11 +95,11 @@ func (s *Server) Stop() error {
 
 	srv := s.srv
 	s.srv = nil
-	s.err = meshnet.ErrClosed
+	s.err = ErrClosed
 
 	err := srv.Close()
 	if err != nil {
-		err = fmt.Errorf("meshnetserver: stop: %w", err)
+		err = fmt.Errorf("server: stop: %w", err)
 	}
 
 	close(s.done)
@@ -112,8 +111,8 @@ func (s *Server) Send() error {
 	return nil
 }
 
-func (s *Server) Clients() []meshnet.ClientInfo {
-	return make([]meshnet.ClientInfo, 0)
+func (s *Server) Clients() []ClientInfo {
+	return make([]ClientInfo, 0)
 }
 
 // Done returns a channel that is closed when the current server has fully stopped and the tailcat server has closed
@@ -140,10 +139,10 @@ func parseAllowedClients(clients []string) ([]key.NodePublic, error) {
 		k := key.NodePublic{}
 		c = strings.TrimSpace(c)
 		if err := k.UnmarshalText([]byte(c)); err != nil {
-			return nil, fmt.Errorf("meshnetserver allow client [%d] %q: %w", i, c, err)
+			return nil, fmt.Errorf("server: allow client [%d] %q: %w", i, c, err)
 		}
 		if k.IsZero() {
-			return nil, fmt.Errorf("meshnetserver allow client [%d] %q: invalid client", i, c)
+			return nil, fmt.Errorf("server: allow client [%d] %q: invalid client", i, c)
 		}
 		out = append(out, k)
 	}
