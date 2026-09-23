@@ -99,7 +99,3 @@ func (s *Server) dispatch(port uint16) func(net.Conn) {
 		return nil
 	}
 }
-
-func (s *Server) handleADB(nc net.Conn)     {}
-func (s *Server) handleCapture(nc net.Conn) {}
-func (s *Server) handleMessage(nc net.Conn) {}
