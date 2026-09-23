@@ -1,5 +1,7 @@
 package meshnet
 
+import "errors"
+
 type State int
 
 const (
@@ -10,16 +12,26 @@ const (
 	StateErrored
 )
 
-var stateName = map[State]string{
-	StateDisconnected:  "Disconnected",
-	StateConnecting:    "Connecting",
-	StateConnected:     "Connected",
-	StateDisconnecting: "Disconnecting",
-	StateErrored:       "Errored",
-}
+var (
+	ErrClosed         = errors.New("meshnet: closed")
+	ErrAlreadyStarted = errors.New("meshnet: already started")
+)
 
 func (s State) String() string {
-	return stateName[s]
+	switch s {
+	case StateConnected:
+		return "Connected"
+	case StateConnecting:
+		return "Connecting"
+	case StateDisconnected:
+		return "Disconnected"
+	case StateDisconnecting:
+		return "Disconnecting"
+	case StateErrored:
+		return "Errored"
+	default:
+		return "Unknown State"
+	}
 }
 
 type ClientInfo struct{}

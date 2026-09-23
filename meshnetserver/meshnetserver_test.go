@@ -1,11 +1,212 @@
 package meshnetserver
 
 import (
+	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	meshnet "github.com/BARGHEST-ngo/MESHnet"
+	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
+
+type fakeTailcat struct {
+	closeCalls atomic.Int32
+}
+
+const fakeAddress = "fake-address"
+
+func (f *fakeTailcat) TailcatAddr() tailcat.Addr {
+	return fakeAddress
+}
+
+func (f *fakeTailcat) Start() error {
+	return nil
+}
+
+func (f *fakeTailcat) Close() error {
+	f.closeCalls.Add(1)
+	return nil
+}
+
+func newTestServer(t *testing.T) (*Server, *fakeTailcat) {
+	t.Helper()
+	fake := &fakeTailcat{}
+	s := New(Config{})
+	s.newTailcat = func([]key.NodePublic) tailcatServer {
+		return fake
+	}
+	return s, fake
+}
+
+func assertClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("channel not closed")
+	}
+}
+
+func assertOpen(t *testing.T, ch <-chan struct{}) {
+	select {
+	case <-ch:
+		t.Fatal("channel closed, want open")
+	default:
+	}
+}
+
+func TestStartStop(t *testing.T) {
+	t.Run("basic start stop", func(t *testing.T) {
+		s, fake := newTestServer(t)
+		addr, err := s.Start()
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if addr != fakeAddress {
+			t.Errorf("addr = %q, want %q", addr, fakeAddress)
+		}
+
+		if err := s.Stop(); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+
+		if n := fake.closeCalls.Load(); n != 1 {
+			t.Errorf("Close called %d times, want 1", n)
+		}
+	})
+
+	t.Run("done before start", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		assertClosed(t, s.Done())
+
+		if !errors.Is(s.Err(), meshnet.ErrClosed) {
+			t.Errorf("expected %v, got %v", meshnet.ErrClosed, s.Err())
+		}
+	})
+
+	t.Run("done while running", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		assertOpen(t, s.Done())
+	})
+
+	t.Run("done after stop", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if err := s.Stop(); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+
+		assertClosed(t, s.Done())
+		if !errors.Is(s.Err(), meshnet.ErrClosed) {
+			t.Errorf("wanted %v, got %v", meshnet.ErrClosed, s.Err())
+		}
+	})
+
+	t.Run("start twice", func(t *testing.T) {
+		s, _ := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if _, err := s.Start(); !errors.Is(err, meshnet.ErrAlreadyStarted) {
+			t.Errorf("wanted %v, got %v", meshnet.ErrAlreadyStarted, err)
+		}
+		assertOpen(t, s.Done())
+	})
+
+	t.Run("stop twice", func(t *testing.T) {
+		s, fake := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if err := s.Stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+
+		if err := s.Stop(); err != nil {
+			t.Errorf("wanted %v, got %v", nil, err)
+		}
+		assertClosed(t, s.Done())
+		if n := fake.closeCalls.Load(); n != 1 {
+			t.Errorf("Close called %d times, want 1", n)
+		}
+	})
+
+	t.Run("stop before start", func(t *testing.T) {
+		s, fake := newTestServer(t)
+		if err := s.Stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+
+		if n := fake.closeCalls.Load(); n != 0 {
+			t.Errorf("Close called %d times, want 0", n)
+		}
+	})
+
+	t.Run("restart", func(t *testing.T) {
+		s, fake := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		first := s.Done()
+
+		if err := s.Stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		second := s.Done()
+
+		assertClosed(t, first)
+		assertOpen(t, second)
+
+		if n := fake.closeCalls.Load(); n != 1 {
+			t.Errorf("Close called %d times, want 1", n)
+		}
+	})
+
+	t.Run("concurrent stop", func(t *testing.T) {
+		s, fake := newTestServer(t)
+		if _, err := s.Start(); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 10 {
+			wg.Go(func() {
+				<-start
+				if err := s.Stop(); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		if n := fake.closeCalls.Load(); n != 1 {
+			t.Errorf("Close called %d times, want 1", n)
+		}
+		assertClosed(t, s.Done())
+		if !errors.Is(s.Err(), meshnet.ErrClosed) {
+			t.Errorf("wanted %v, got %v", meshnet.ErrClosed, s.Err())
+		}
+	})
+}
 
 func TestParseAllowedClients(t *testing.T) {
 	k1 := key.NewNode().Public().String()
@@ -32,8 +233,14 @@ func TestParseAllowedClients(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseAllowedClients(tc.in)
-			if err != nil && !tc.wantErr {
-				t.Errorf("unexpected error: %v", err)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
 
 			if tc.wantErr {
