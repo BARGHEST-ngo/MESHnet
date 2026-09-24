@@ -9,18 +9,20 @@ import (
 
 type Kind uint8
 
-// 0 Kind is invalid
 const (
-	KindHello    Kind = iota + 1 // client > server: identify and pair
-	KindHelloAck                 // server > client: handshake accepted
-	KindMsg                      // application message
-	KindPing                     // alive check
-	KindPong                     // response to ping
-	KindClose                    // closing, with a reason
+	KindInvalid  Kind = iota
+	KindHello         // client > server: identify and pair
+	KindHelloAck      // server > client: handshake accepted
+	KindMsg           // application message
+	KindPing          // alive check
+	KindPong          // response to ping
+	KindClose         // closing, with a reason
 )
 
 func (k Kind) String() string {
 	switch k {
+	case KindInvalid:
+		return "invalid"
 	case KindHello:
 		return "hello"
 	case KindHelloAck:
@@ -88,17 +90,17 @@ func readHeader(r io.Reader) (Kind, uint32, error) {
 		if err == io.EOF {
 			return 0, 0, io.EOF
 		}
-		return 0, 0, fmt.Errorf("protocol: read header: %w", err)
+		return KindInvalid, 0, fmt.Errorf("protocol: read header: %w", err)
 	}
 
 	length := binary.BigEndian.Uint32(header[:kindOffset])
 	kind := Kind(header[kindOffset])
 	if !kind.valid() {
-		return 0, 0, fmt.Errorf("%w: kind %d", ErrUnknownKind, kind)
+		return KindInvalid, 0, fmt.Errorf("%w: kind %d", ErrUnknownKind, kind)
 	}
 
 	if length > MaxPayloadSize {
-		return 0, 0, fmt.Errorf("%w: size %d", ErrFrameTooLarge, length)
+		return KindInvalid, 0, fmt.Errorf("%w: size %d", ErrFrameTooLarge, length)
 	}
 	return kind, length, nil
 }

@@ -115,7 +115,7 @@ func TestReadFrameErrors(t *testing.T) {
 		},
 		{
 			name:  "kind zero",
-			input: rawHeader(0, 0),
+			input: rawHeader(0, KindInvalid),
 			want:  ErrUnknownKind,
 		},
 		{
@@ -152,7 +152,7 @@ func TestWriteFrameErrors(t *testing.T) {
 	}{
 		{
 			name:  "kind zero",
-			frame: Frame{Kind: 0, Payload: nil},
+			frame: Frame{Kind: KindInvalid, Payload: nil},
 			want:  ErrUnknownKind,
 		},
 		{
@@ -203,7 +203,7 @@ func FuzzReadFrame(f *testing.F) {
 		{0x00, 0x00}, // partial header
 		rawHeader(3, KindMsg),
 		append(rawHeader(3, KindMsg), 'a'), //partial payload
-		rawHeader(0, 0),
+		rawHeader(0, KindInvalid),
 		rawHeader(0, KindClose+1),
 		rawHeader(0, 255),
 		rawHeader(MaxPayloadSize, KindMsg),
