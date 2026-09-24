@@ -182,6 +182,27 @@ func TestWriteFrameErrors(t *testing.T) {
 	}
 }
 
+type failWriter struct {
+	err error
+}
+
+func (w failWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func TestWriteFrameWriterError(t *testing.T) {
+	writeErr := errors.New("some error happened")
+	w := failWriter{err: writeErr}
+	err := WriteFrame(w, Frame{Kind: KindHello, Payload: []byte("abc")})
+	if err == nil {
+		t.Fatal("WriteFrame: got nil error, want writer's error")
+	}
+
+	if !errors.Is(err, writeErr) {
+		t.Errorf("WriteFrame error: %v, want to wrap %v", err, writeErr)
+	}
+}
+
 func encodeFrame(f *testing.F, frame Frame) []byte {
 	var b bytes.Buffer
 	if err := WriteFrame(&b, frame); err != nil {
