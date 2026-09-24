@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    name: Protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./internal/protocol
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./internal/protocol
+      - name: Coverage
+        run: go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: FuzzReadFrame
+        run: go test -run '^$' -fuzz=FuzzReadFrame -fuzztime=30s ./internal/protocol
