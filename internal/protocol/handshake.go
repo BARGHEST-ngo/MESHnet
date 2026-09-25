@@ -16,6 +16,7 @@ const (
 	keyLen        = len(keyPrefix) + 64 //32 byte key hex-encoded
 	versionSize   = 2
 	strPrefixSize = 1
+	closeErrSize  = 1
 )
 
 type CloseErr uint8
@@ -50,9 +51,54 @@ type Close struct {
 	Message string
 }
 
-func (c Close) validate() error                 { return nil }
-func (c Close) MarshalBinary() ([]byte, error)  { return nil, nil }
-func (c *Close) UnmarshalBinary(b []byte) error { return nil }
+func (c Close) validate() error {
+	if len(c.Message) > MaxMessageLen {
+		return fmt.Errorf("%w: message length %d exceeds %d", ErrMalformedPayload, len(c.Message), MaxMessageLen)
+	}
+	return nil
+}
+
+func (c Close) MarshalBinary() ([]byte, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+
+	b := make([]byte, 0)
+	b = append(b, byte(c.Err))
+	b, err := appendString(b, c.Message)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func (c *Close) UnmarshalBinary(b []byte) error {
+	if len(b) < closeErrSize {
+		return fmt.Errorf("%w: missing close error code", ErrMalformedPayload)
+	}
+
+	closeErr := CloseErr(b[0])
+	msg, remaining, err := readString(b[closeErrSize:])
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) != 0 {
+		return fmt.Errorf("%w: %d trailing bytes", ErrMalformedPayload, len(remaining))
+	}
+
+	decoded := Close{
+		Err:     closeErr,
+		Message: msg,
+	}
+	if err := decoded.validate(); err != nil {
+		return err
+	}
+
+	*c = decoded
+	return nil
+}
 
 type Hello struct {
 	Version uint16
@@ -61,9 +107,96 @@ type Hello struct {
 	PIN     string
 }
 
-func (h Hello) validate() error                 { return nil }
-func (h Hello) MarshalBinary() ([]byte, error)  { return nil, nil }
-func (h *Hello) UnmarshalBinary(b []byte) error { return nil }
+func (h Hello) validate() error {
+	if h.Version == 0 {
+		return fmt.Errorf("%w: version 0 is invalid", ErrMalformedPayload)
+	}
+
+	if err := validateKey("key", h.Key); err != nil {
+		return err
+	}
+
+	if len(h.Name) > MaxNameLen {
+		return fmt.Errorf("%w: name length %d exceeds %d", ErrMalformedPayload, len(h.Name), MaxNameLen)
+	}
+
+	if len(h.PIN) != PINLength {
+		return fmt.Errorf("%w: invalid PIN length %d, expect %d", ErrMalformedPayload, len(h.PIN), PINLength)
+	}
+
+	for _, c := range h.PIN {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("%w: PIN must only contain digits", ErrMalformedPayload)
+		}
+	}
+
+	return nil
+}
+
+func (h Hello) MarshalBinary() ([]byte, error) {
+	if err := h.validate(); err != nil {
+		return nil, err
+	}
+
+	b := make([]byte, 0)
+	b = binary.BigEndian.AppendUint16(b, h.Version)
+	b, err := appendString(b, h.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err = appendString(b, h.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err = appendString(b, h.PIN)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func (h *Hello) UnmarshalBinary(b []byte) error {
+	version, remaining, err := readUint16(b)
+	if err != nil {
+		return err
+	}
+
+	key, remaining, err := readString(remaining)
+	if err != nil {
+		return err
+	}
+
+	name, remaining, err := readString(remaining)
+	if err != nil {
+		return err
+	}
+
+	pin, remaining, err := readString(remaining)
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) != 0 {
+		return fmt.Errorf("%w: %d trailing bytes", ErrMalformedPayload, len(remaining))
+	}
+
+	decoded := Hello{
+		Version: version,
+		Key:     key,
+		Name:    name,
+		PIN:     pin,
+	}
+
+	if err := decoded.validate(); err != nil {
+		return err
+	}
+
+	*h = decoded
+	return nil
+}
 
 type HelloAck struct {
 	Version  uint16
@@ -75,14 +208,7 @@ func (h HelloAck) validate() error {
 		return fmt.Errorf("%w: version 0 is invalid", ErrMalformedPayload)
 	}
 
-	if len(h.ClientID) != keyLen {
-		return fmt.Errorf("%w: client ID length %d, want %d", ErrMalformedPayload, len(h.ClientID), keyLen)
-	}
-
-	if !strings.HasPrefix(h.ClientID, keyPrefix) {
-		return fmt.Errorf("%w: client ID missing %q prefix", ErrMalformedPayload, keyPrefix)
-	}
-	return nil
+	return validateKey("client ID", h.ClientID)
 }
 
 func (h HelloAck) MarshalBinary() ([]byte, error) {
@@ -90,7 +216,7 @@ func (h HelloAck) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 
-	b := make([]byte, 0, versionSize+strPrefixSize+keyLen)
+	b := make([]byte, 0)
 	b = binary.BigEndian.AppendUint16(b, h.Version)
 	b, err := appendString(b, h.ClientID)
 	if err != nil {
@@ -122,8 +248,19 @@ func (h *HelloAck) UnmarshalBinary(b []byte) error {
 	if err := decoded.validate(); err != nil {
 		return err
 	}
-	*h = decoded
 
+	*h = decoded
+	return nil
+}
+
+func validateKey(field, s string) error {
+	if len(s) != keyLen {
+		return fmt.Errorf("%w: %s length %d, want %d", ErrMalformedPayload, field, len(s), keyLen)
+	}
+
+	if !strings.HasPrefix(s, keyPrefix) {
+		return fmt.Errorf("%w: %s missing %q prefix", ErrMalformedPayload, field, keyPrefix)
+	}
 	return nil
 }
 
