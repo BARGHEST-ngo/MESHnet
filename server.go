@@ -27,6 +27,10 @@ type ServerConfig struct {
 	Logf           func(format string, args ...any)
 }
 
+// session is the state for one paired client's connection
+// Stop uses it to close the connection, Send (will) write to it.
+// per-client state will live here (writer queue, liveness, streams)
+// currently one per server run
 type session struct {
 	conn     net.Conn
 	clientID string
@@ -140,11 +144,12 @@ func (s *Server) Stop() error {
 }
 
 // send message to a client
-func (s *Server) Send() error {
+func (s *Server) Send(clientID string, m Message) error {
 	return nil
 }
 
 func (s *Server) Clients() []ClientInfo {
+	// TODO
 	return make([]ClientInfo, 0)
 }
 
@@ -248,6 +253,7 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 		return s.handleMsg(sess, f)
 	case protocol.KindClose:
 		return s.handleClose(sess, f)
+	// TODO:
 	//case protocol.KindPing:
 	//case protocol.KindPong:
 	default:
@@ -283,6 +289,10 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	}
 
 	s.mu.Lock()
+	// Likely going to refactor this switch block
+	// Confirms a Hello message is valid
+	// More checks to add such as confirming the message has come from
+	// an expected IP
 	var reason protocol.CloseErr
 	var sess *session
 	switch {
@@ -326,9 +336,11 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
+	// TODO
 	return nil
 }
 
 func (s *Server) handleClose(sess *session, f protocol.Frame) error {
+	// TODO
 	return nil
 }

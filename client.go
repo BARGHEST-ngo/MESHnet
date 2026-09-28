@@ -21,10 +21,10 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	mu   sync.Mutex
+	mu   sync.Mutex // guards all to the line break
 	tc   *tailcat.Client
 	conn net.Conn
-	used bool
+	used bool // Connect has been called, Clients are single-use
 
 	cfg       ClientConfig
 	onMessage func(m Message)
@@ -118,7 +118,10 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
-func (c *Client) Send(m Message) error { return nil }
+func (c *Client) Send(m Message) error {
+	//TODO
+	return nil
+}
 
 func (c *Client) ID() string {
 	c.mu.Lock()
