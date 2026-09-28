@@ -30,6 +30,6 @@ func main() {
 			log.Printf("stop: %v", err)
 		}
 	case <-srv.Done():
-		log.Print("server stopped: %v", srv.Err())
+		log.Printf("server stopped: %v", srv.Err())
 	}
 }

@@ -20,6 +20,7 @@ type tailcatServer interface {
 	Start() error
 	Close() error
 	TailcatAddr() tailcat.Addr
+	AddAllowedClient(k key.NodePublic)
 }
 
 type ServerConfig struct {
@@ -77,7 +78,6 @@ func (s *Server) buildTailcat(allow []key.NodePublic) tailcatServer {
 		Logf:           s.cfg.Logf,
 		AllowedClients: allow,
 	}
-
 	return srv
 }
 
@@ -195,17 +195,27 @@ func parseAllowedClients(clients []string) ([]key.NodePublic, error) {
 	out := make([]key.NodePublic, 0, len(clients))
 
 	for i, c := range clients {
-		k := key.NodePublic{}
 		c = strings.TrimSpace(c)
-		if err := k.UnmarshalText([]byte(c)); err != nil {
-			return nil, fmt.Errorf("server: allow client [%d] %q: %w", i, c, err)
+		k, err := parseKey(c)
+		if err != nil {
+			return nil, fmt.Errorf("allow client [%d]: %w", i, err)
 		}
-		if k.IsZero() {
-			return nil, fmt.Errorf("server: allow client [%d] %q: invalid client", i, c)
-		}
-		out = append(out, k)
+
+		out = append(out, *k)
 	}
 
+	return out, nil
+}
+
+func parseKey(k string) (*key.NodePublic, error) {
+	out := &key.NodePublic{}
+	if err := out.UnmarshalText([]byte(k)); err != nil {
+		return nil, fmt.Errorf("server: parse key: %q: %w", k, err)
+	}
+
+	if out.IsZero() {
+		return nil, fmt.Errorf("server: parse key: %q: invalid key", k)
+	}
 	return out, nil
 }
 
@@ -261,6 +271,9 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 	}
 }
 
+// TODO - If the server starts with a pre-approved list of client keys, the PIN is not required
+// but this handshake handler currently demands one
+// Not needed in our existing use-case for MESHnet so will come abck to that one...
 func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
@@ -271,7 +284,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	}
 
 	if f.Kind != protocol.KindHello {
-		s.cfg.Logf("handleshake: unexpected frame %d", f.Kind)
+		s.cfg.Logf("handleshake: unexpected frame %v", f.Kind)
 		return nil, false
 	}
 
@@ -288,13 +301,14 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		return nil, false
 	}
 
-	s.mu.Lock()
 	// Likely going to refactor this switch block
 	// Confirms a Hello message is valid
-	// More checks to add such as confirming the message has come from
-	// an expected IP
+	// key-to-tunnel-IP check will go here..
+	clientKey, keyParseErr := parseKey(h.Key)
+	s.mu.Lock()
 	var reason protocol.CloseErr
 	var sess *session
+	srv := s.srv
 	switch {
 	case h.Version != protocol.Version:
 		reason = protocol.CloseErrVersionMismatch
@@ -302,6 +316,8 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		reason = protocol.CloseErrPairingLocked
 	case subtle.ConstantTimeCompare([]byte(h.PIN), []byte(s.pin)) != 1:
 		reason = protocol.CloseErrWrongPIN
+	case keyParseErr != nil:
+		reason = protocol.CloseErrInvalidKey
 	default:
 		s.paired = true
 		sess = &session{
@@ -321,6 +337,8 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		}
 		return nil, false
 	}
+
+	srv.AddAllowedClient(*clientKey)
 
 	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
 		Version:  protocol.Version,
