@@ -11,6 +11,9 @@ import (
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
 )
 
+// First run `go run ./examples/server`
+// Copy the address and pin output
+// `go run ./examples/client -addr '<addr>' -pin <pin>`
 func main() {
 	addr := flag.String("addr", "", "server address")
 	pin := flag.String("pin", "", "pairing PIN")

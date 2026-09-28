@@ -11,7 +11,7 @@ import (
 
 func main() {
 	srv := meshnet.NewServer(meshnet.ServerConfig{
-		Logf: nil,
+		Logf: log.Printf,
 	})
 
 	addr, err := srv.Start()
