@@ -14,7 +14,7 @@ const (
 
 	keyPrefix     = "nodekey:"
 	keyLen        = len(keyPrefix) + 64 //32 byte key hex-encoded
-	versionSize   = 2
+	uint16Size    = 2
 	strPrefixSize = 1
 	closeErrSize  = 1
 )
@@ -291,8 +291,8 @@ func readString(b []byte) (string, []byte, error) {
 }
 
 func readUint16(b []byte) (uint16, []byte, error) {
-	if len(b) < versionSize {
-		return 0, nil, fmt.Errorf("%w: need %d bytes for uint16, got %d", ErrMalformedPayload, versionSize, len(b))
+	if len(b) < uint16Size {
+		return 0, nil, fmt.Errorf("%w: need %d bytes for uint16, got %d", ErrMalformedPayload, uint16Size, len(b))
 	}
-	return binary.BigEndian.Uint16(b), b[versionSize:], nil
+	return binary.BigEndian.Uint16(b), b[uint16Size:], nil
 }
