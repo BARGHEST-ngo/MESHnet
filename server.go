@@ -213,9 +213,13 @@ func (s *Server) OnMessage(fn func(clientID string, m Message)) {
 	s.onMessage = fn
 }
 
+// Returns the current PIN or empty string if the server isn't running
 func (s *Server) PairingPIN() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.srv == nil {
+		return ""
+	}
 	return s.pairing.pin
 }
 
