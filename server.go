@@ -35,7 +35,6 @@ type ServerConfig struct {
 type session struct {
 	conn     net.Conn
 	clientID string
-	writeMu  sync.Mutex
 }
 
 type Server struct {

@@ -28,7 +28,6 @@ type Client struct {
 
 	cfg       ClientConfig
 	onMessage func(m Message)
-	writeMu   sync.Mutex
 }
 
 func NewClient(cfg ClientConfig) *Client {
@@ -97,7 +96,7 @@ func (c *Client) Disconnect() error {
 	tc := c.tc
 	conn := c.conn
 
-	if conn == nil {
+	if conn == nil && tc == nil {
 		c.mu.Unlock()
 		return nil
 	}
