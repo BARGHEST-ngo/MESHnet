@@ -245,3 +245,132 @@ func TestRoundTripHello(t *testing.T) {
 		})
 	}
 }
+
+func TestRoundTripMsg(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Msg
+	}{
+		{name: "no data", in: Msg{Topic: "topic", Data: nil}},
+		{name: "text data", in: Msg{Topic: "topic", Data: []byte("hot")}},
+		{name: "max topic length", in: Msg{Topic: maxString(), Data: nil}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := tc.in.MarshalBinary()
+			if err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
+
+			var decoded Msg
+			if err := decoded.UnmarshalBinary(b); err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
+
+			if decoded.Topic != tc.in.Topic {
+				t.Errorf("expected %v, got %v", tc.in.Topic, decoded.Topic)
+			}
+
+			if !bytes.Equal(tc.in.Data, decoded.Data) {
+				t.Errorf("expected %v, got %v", tc.in.Data, decoded.Data)
+			}
+		})
+	}
+}
+
+func TestMalformedClose(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{name: "empty", in: nil},
+		{name: "code only, no length", in: []byte{0x01}},
+		{name: "length past end", in: []byte{0x01, 0x05, 'a'}},
+		{name: "trailing bytes", in: []byte{0x01, 0x01, 'a', 'b'}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Logf("%v", tc.in)
+			var cl Close
+			if err := cl.UnmarshalBinary(tc.in); err != nil {
+				if !errors.Is(err, ErrMalformedPayload) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				t.Errorf("expected %v, got nil", ErrMalformedPayload)
+			}
+		})
+	}
+}
+
+// Returns s with u8 length prefix, if appendString changes this will tell us
+func lenPrefixed(s string) []byte {
+	len := byte(len(s))
+	return append([]byte{len}, s...)
+}
+
+func join(parts ...[]byte) []byte {
+	return bytes.Join(parts, nil)
+}
+
+var v1 = []byte{0x00, 0x01} // uint16 version 1
+
+func TestMalformedHello(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{name: "truncated after key", in: join(v1, lenPrefixed(testClientKey))},
+		{name: "truncated after name", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"))},
+		{name: "version 0", in: join([]byte{0, 0}, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("123456"))},
+		{name: "pin too short", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("12345"))},
+		{name: "pin too long", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("1234567"))},
+		{name: "pin with letter", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("12a456"))},
+		{name: "empty pin", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed(""))},
+		{name: "name too long", in: join(v1, lenPrefixed(testClientKey), lenPrefixed(strings.Repeat("n", MaxNameLen+1)), lenPrefixed("123456"))},
+		{name: "trailing bytes", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("123456"), []byte{0xff})},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var h Hello
+			if err := h.UnmarshalBinary(tc.in); err != nil {
+				if !errors.Is(err, ErrMalformedPayload) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				t.Errorf("expected %v, got nil", ErrMalformedPayload)
+			}
+		})
+	}
+}
+
+func TestMalformedHelloAck(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{name: "empty", in: nil},
+		{name: "broken version", in: []byte{0x00}},
+		{name: "version only", in: v1},
+		{name: "version zero", in: join([]byte{0, 0}, lenPrefixed(testClientKey))},
+		{name: "short key", in: join(v1, lenPrefixed(testClientKey[:32]))},
+		{name: "invalid key prefix", in: join(v1, lenPrefixed("nodekez:"+testClientKey[8:]))},
+		{name: "trailing bytes", in: join(v1, lenPrefixed(testClientKey), []byte{0xff})},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var h HelloAck
+			if err := h.UnmarshalBinary(tc.in); err != nil {
+				if !errors.Is(err, ErrMalformedPayload) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				t.Errorf("expected %v, got nil", ErrMalformedPayload)
+			}
+		})
+	}
+}
