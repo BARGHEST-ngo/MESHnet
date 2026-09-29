@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding"
 	"errors"
 	"math"
 	"strings"
@@ -325,6 +326,7 @@ func TestMalformedHello(t *testing.T) {
 		{name: "truncated after key", in: join(v1, lenPrefixed(testClientKey))},
 		{name: "truncated after name", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"))},
 		{name: "version 0", in: join([]byte{0, 0}, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("123456"))},
+		{name: "invalid key", in: join(v1, lenPrefixed(testClientKey[:32]), lenPrefixed("n"), lenPrefixed("123456"))},
 		{name: "pin too short", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("12345"))},
 		{name: "pin too long", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("1234567"))},
 		{name: "pin with letter", in: join(v1, lenPrefixed(testClientKey), lenPrefixed("n"), lenPrefixed("12a456"))},
@@ -372,5 +374,54 @@ func TestMalformedHelloAck(t *testing.T) {
 				t.Errorf("expected %v, got nil", ErrMalformedPayload)
 			}
 		})
+	}
+}
+
+func TestMalformedMsg(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{name: "empty", in: nil},
+		{name: "empty topic", in: join(lenPrefixed(""), []byte("data"))},
+		{name: "topic length past end", in: []byte{0x05, 'a', 'b'}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var m Msg
+			if err := m.UnmarshalBinary(tc.in); err != nil {
+				if !errors.Is(err, ErrMalformedPayload) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				t.Errorf("expected %v, got nil", ErrMalformedPayload)
+			}
+		})
+	}
+}
+
+func TestMarshal(t *testing.T) {
+	cases := []struct {
+		name  string
+		value encoding.BinaryMarshaler
+	}{
+		{name: "close message too long", value: Close{Err: CloseErrError, Message: maxString() + "a"}},
+		{name: "hello invalid PIN", value: Hello{Version: Version, Key: testClientKey, PIN: "12345"}},
+		{name: "hello invalid key", value: Hello{Version: Version, Key: testClientKey, PIN: "123456", Name: strings.Repeat("a", MaxNameLen+1)}},
+		{name: "helloAck invalid version", value: HelloAck{Version: 0, ClientID: testClientKey}},
+		{name: "helloAck invalid key", value: HelloAck{Version: 1, ClientID: "nodekey:invalid-key"}},
+		{name: "msg empty topic", value: Msg{Topic: ""}},
+	}
+
+	for _, tc := range cases {
+		_, err := tc.value.MarshalBinary()
+		if err != nil {
+			if !errors.Is(err, ErrMalformedPayload) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		} else {
+			t.Errorf("expected %v, got nil", ErrMalformedPayload)
+		}
 	}
 }
