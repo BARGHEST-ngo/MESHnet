@@ -26,6 +26,19 @@ func pipe(t *testing.T) (writer, reader net.Conn) {
 	return a, b
 }
 
+type failWriter struct{ err error }
+
+func (f failWriter) Write([]byte) (int, error) { return 0, f.err }
+
+func waitStopped(t *testing.T, w *Writer) {
+	t.Helper()
+	select {
+	case <-w.exited:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writer did not stop after a write error")
+	}
+}
+
 func TestWriterOrder(t *testing.T) {
 	numFrames := 50
 	pipeWriter, pipeReader := pipe(t)
@@ -180,5 +193,27 @@ func TestCloseTwice(t *testing.T) {
 	case <-closed:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("second Close() blocked")
+	}
+}
+
+func TestWriterWriteError(t *testing.T) {
+	boom := errors.New("boom")
+	w := NewWriter(failWriter{err: boom})
+	defer w.Close()
+
+	if err := w.Err(); err != nil {
+		t.Fatalf("Err before any write: %v, want nil", err)
+	}
+
+	if err := w.Enqueue(frame(0)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitStopped(t, w)
+
+	if err := w.Err(); !errors.Is(err, boom) {
+		t.Fatalf("Err = %v, want %v", err, boom)
+	}
+	if err := w.Enqueue(frame(1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("enqueue after write error = %v, want ErrClosed", err)
 	}
 }
