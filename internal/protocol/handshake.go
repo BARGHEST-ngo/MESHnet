@@ -26,6 +26,7 @@ const (
 	CloseErrVersionMismatch
 	CloseErrWrongPIN
 	CloseErrPairingLocked
+	CloseErrInvalidKey
 	CloseErrError
 )
 
@@ -39,6 +40,8 @@ func (e CloseErr) String() string {
 		return "wrong_pin"
 	case CloseErrPairingLocked:
 		return "pairing_locked"
+	case CloseErrInvalidKey:
+		return "invalid_key"
 	case CloseErrError:
 		return "error"
 	default:

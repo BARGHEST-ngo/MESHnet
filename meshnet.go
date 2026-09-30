@@ -34,4 +34,12 @@ func (s State) String() string {
 	}
 }
 
-type ClientInfo struct{}
+type ClientInfo struct {
+	ID   string
+	Name string
+}
+
+type Message struct {
+	Topic string //app-defined key
+	Data  []byte
+}

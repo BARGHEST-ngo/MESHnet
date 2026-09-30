@@ -116,7 +116,7 @@ func readPayload(r io.Reader, length uint32) ([]byte, error) {
 	return payload, nil
 }
 
-func WriteFrame(w io.Writer, f Frame) error {
+func writeFrame(w io.Writer, f Frame) error {
 	if !f.Kind.valid() {
 		return fmt.Errorf("%w: kind %d", ErrUnknownKind, f.Kind)
 	}

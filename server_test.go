@@ -31,6 +31,8 @@ func (f *fakeTailcat) Close() error {
 	return nil
 }
 
+func (f *fakeTailcat) AddAllowedClient(k key.NodePublic) {}
+
 func newTestServer(t *testing.T) (*Server, *fakeTailcat) {
 	t.Helper()
 	fake := &fakeTailcat{}

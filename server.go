@@ -1,12 +1,17 @@
 package meshnet
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
+	"math/big"
 	"net"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
@@ -15,6 +20,7 @@ type tailcatServer interface {
 	Start() error
 	Close() error
 	TailcatAddr() tailcat.Addr
+	AddAllowedClient(k key.NodePublic)
 }
 
 type ServerConfig struct {
@@ -22,14 +28,32 @@ type ServerConfig struct {
 	Logf           func(format string, args ...any)
 }
 
+// session is the state for one paired client's connection
+// Stop uses it to close the connection, Send (will) write to it.
+// per-client state will live here (writer queue, liveness, streams)
+// currently one per server run
+type session struct {
+	conn     net.Conn
+	clientID string
+}
+
+type pairing struct {
+	pin  string
+	used bool // the PIN has been redeemed, no more pairings this run
+	// later - attempt limits, expiry time
+}
+
 type Server struct {
-	mu   sync.Mutex // guards srv, done, err
-	srv  tailcatServer
-	done chan struct{}
-	err  error
+	mu      sync.Mutex // guards all before line break
+	srv     tailcatServer
+	done    chan struct{}
+	err     error
+	pairing pairing // to be a map of potential pairings for multiple clients
+	sess    *session
 
 	cfg        ServerConfig
 	newTailcat func([]key.NodePublic) tailcatServer
+	onMessage  func(clientID string, m Message)
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -43,12 +67,38 @@ func NewServer(cfg ServerConfig) *Server {
 	done := make(chan struct{})
 	close(done)
 	s := &Server{
-		done: done,
-		err:  ErrClosed,
-		cfg:  cfg,
+		done:      done,
+		err:       ErrClosed,
+		cfg:       cfg,
+		onMessage: func(clientID string, m Message) {},
 	}
 	s.newTailcat = s.buildTailcat
 	return s
+}
+
+func newPairing() (pairing, error) {
+	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return pairing{}, fmt.Errorf("generate PIN: %w", err)
+	}
+
+	return pairing{
+		pin:  fmt.Sprintf("%06d", pin),
+		used: false,
+	}, nil
+}
+
+func (p *pairing) redeem(pin string) protocol.CloseErr {
+	if p.used {
+		return protocol.CloseErrPairingLocked
+	}
+
+	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
+		return protocol.CloseErrWrongPIN
+	}
+
+	p.used = true
+	return protocol.CloseErrNone
 }
 
 func (s *Server) buildTailcat(allow []key.NodePublic) tailcatServer {
@@ -57,7 +107,6 @@ func (s *Server) buildTailcat(allow []key.NodePublic) tailcatServer {
 		Logf:           s.cfg.Logf,
 		AllowedClients: allow,
 	}
-
 	return srv
 }
 
@@ -73,11 +122,17 @@ func (s *Server) Start() (addr string, err error) {
 		return "", fmt.Errorf("server: start: %w", err)
 	}
 
+	p, err := newPairing()
+	if err != nil {
+		return "", fmt.Errorf("server: start: %w", err)
+	}
+
 	srv := s.newTailcat(allowList)
 	if err := srv.Start(); err != nil {
 		return "", fmt.Errorf("server: start: %w", err)
 	}
 
+	s.pairing = p
 	s.done = make(chan struct{})
 	s.err = nil
 	s.srv = srv
@@ -87,31 +142,42 @@ func (s *Server) Start() (addr string, err error) {
 
 func (s *Server) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.srv == nil {
+		// Not running or already shutting down
+		done := s.done
+		s.mu.Unlock()
+		<-done
 		return nil
 	}
 
 	srv := s.srv
+	sess := s.sess
+	done := s.done
 	s.srv = nil
+	s.sess = nil
 	s.err = ErrClosed
+	s.mu.Unlock()
 
-	err := srv.Close()
-	if err != nil {
-		err = fmt.Errorf("server: stop: %w", err)
+	if sess != nil {
+		sess.conn.Close()
 	}
 
-	close(s.done)
+	err := srv.Close()
+	close(done)
+	if err != nil {
+		return fmt.Errorf("server: stop: %w", err)
+	}
+
 	return err
 }
 
 // send message to a client
-func (s *Server) Send() error {
+func (s *Server) Send(clientID string, m Message) error {
 	return nil
 }
 
 func (s *Server) Clients() []ClientInfo {
+	// TODO
 	return make([]ClientInfo, 0)
 }
 
@@ -132,27 +198,196 @@ func (s *Server) Err() error {
 	return s.err
 }
 
+// Register OnMessage handler. nil sets callback as a no-op
+func (s *Server) OnMessage(fn func(clientID string, m Message)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.srv != nil {
+		panic("meshnet: OnMessage called after Start")
+	}
+
+	if fn == nil {
+		fn = func(clientID string, m Message) {}
+	}
+
+	s.onMessage = fn
+}
+
+// Returns the current PIN or empty string if the server isn't running
+func (s *Server) PairingPIN() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.srv == nil {
+		return ""
+	}
+	return s.pairing.pin
+}
+
 func parseAllowedClients(clients []string) ([]key.NodePublic, error) {
 	out := make([]key.NodePublic, 0, len(clients))
 
 	for i, c := range clients {
-		k := key.NodePublic{}
 		c = strings.TrimSpace(c)
-		if err := k.UnmarshalText([]byte(c)); err != nil {
-			return nil, fmt.Errorf("server: allow client [%d] %q: %w", i, c, err)
+		k, err := parseKey(c)
+		if err != nil {
+			return nil, fmt.Errorf("allow client [%d]: %w", i, err)
 		}
-		if k.IsZero() {
-			return nil, fmt.Errorf("server: allow client [%d] %q: invalid client", i, c)
-		}
-		out = append(out, k)
+
+		out = append(out, *k)
 	}
 
 	return out, nil
 }
 
+func parseKey(k string) (*key.NodePublic, error) {
+	out := &key.NodePublic{}
+	if err := out.UnmarshalText([]byte(k)); err != nil {
+		return nil, fmt.Errorf("server: parse key: %q: %w", k, err)
+	}
+
+	if out.IsZero() {
+		return nil, fmt.Errorf("server: parse key: %q: invalid key", k)
+	}
+	return out, nil
+}
+
 func (s *Server) dispatch(port uint16) func(net.Conn) {
 	switch port {
+	case protocol.ControlPort:
+		return s.handleControl
 	default:
 		return nil
 	}
+}
+
+func (s *Server) handleControl(conn net.Conn) {
+	defer conn.Close()
+	sess, ok := s.handleShake(conn)
+	if !ok {
+		return
+	}
+
+	defer func() {
+		s.mu.Lock()
+		if s.sess == sess {
+			s.sess = nil
+		}
+		s.mu.Unlock()
+	}()
+
+	for {
+		f, err := protocol.ReadFrame(conn)
+		if err != nil {
+			// EOF
+			return
+		}
+
+		if err := s.handleFrame(sess, f); err != nil {
+			s.cfg.Logf("handle frame: %v", err)
+			return
+		}
+	}
+}
+
+func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
+	switch f.Kind {
+	case protocol.KindMsg:
+		return s.handleMsg(sess, f)
+	case protocol.KindClose:
+		return s.handleClose(sess, f)
+	// TODO:
+	//case protocol.KindPing:
+	//case protocol.KindPong:
+	default:
+		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
+	}
+}
+
+// TODO - If the server starts with a pre-approved list of client keys, the PIN is not required
+// but this handshake handler currently demands one
+// Not needed in our existing use-case for MESHnet so will come abck to that one...
+func (s *Server) handleShake(conn net.Conn) (*session, bool) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	f, err := protocol.ReadFrame(conn)
+	if err != nil {
+		s.cfg.Logf("handleShake: %v", err)
+		return nil, false
+	}
+
+	if f.Kind != protocol.KindHello {
+		s.cfg.Logf("handleshake: unexpected frame %v", f.Kind)
+		return nil, false
+	}
+
+	var h protocol.Hello
+	if err := h.UnmarshalBinary(f.Payload); err != nil {
+		c := protocol.Close{
+			Err:     protocol.CloseErrError,
+			Message: "malformed hello payload",
+		}
+
+		if err := protocol.WritePayload(conn, protocol.KindClose, c); err != nil {
+			s.cfg.Logf("handleShake: %v", err)
+		}
+		return nil, false
+	}
+
+	// Likely going to refactor this switch block
+	// Confirms a Hello message is valid
+	// key-to-tunnel-IP check will go here..
+	clientKey, keyParseErr := parseKey(h.Key)
+	s.mu.Lock()
+	var reason protocol.CloseErr
+	var sess *session
+	srv := s.srv
+	switch {
+	case h.Version != protocol.Version:
+		reason = protocol.CloseErrVersionMismatch
+	case keyParseErr != nil:
+		reason = protocol.CloseErrInvalidKey
+	default:
+		reason = s.pairing.redeem(h.PIN)
+	}
+	s.mu.Unlock()
+
+	if reason != protocol.CloseErrNone {
+		c := protocol.Close{
+			Err: reason,
+		}
+		if err := protocol.WritePayload(conn, protocol.KindClose, c); err != nil {
+			s.cfg.Logf("handleShake: %v", err)
+		}
+		return nil, false
+	}
+
+	sess = &session{
+		conn:     conn,
+		clientID: h.Key,
+	}
+	s.sess = sess
+
+	srv.AddAllowedClient(*clientKey)
+
+	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
+		Version:  protocol.Version,
+		ClientID: h.Key,
+	}); err != nil {
+		s.cfg.Logf("handleShake: %v", err)
+		return nil, false
+	}
+
+	conn.SetDeadline(time.Time{})
+
+	return sess, true
+}
+
+func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
+	// TODO
+	return nil
+}
+
+func (s *Server) handleClose(sess *session, f protocol.Frame) error {
+	// TODO
+	return nil
 }
