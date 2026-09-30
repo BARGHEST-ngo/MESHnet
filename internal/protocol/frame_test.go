@@ -68,7 +68,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var b bytes.Buffer
-			if err := writeFrame(&b, tc.frame); err != nil {
+			if err := WriteFrame(&b, tc.frame); err != nil {
 				t.Fatalf("WriteFrame: %v", err)
 			}
 
@@ -170,7 +170,7 @@ func TestWriteFrameErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var b bytes.Buffer
-			err := writeFrame(&b, tc.frame)
+			err := WriteFrame(&b, tc.frame)
 			if err == nil {
 				t.Fatalf("expected %v, got nil err", tc.want)
 			}
@@ -193,7 +193,7 @@ func (w failWriter) Write([]byte) (int, error) {
 func TestWriteFrameWriterError(t *testing.T) {
 	writeErr := errors.New("some error happened")
 	w := failWriter{err: writeErr}
-	err := writeFrame(w, Frame{Kind: KindHello, Payload: []byte("abc")})
+	err := WriteFrame(w, Frame{Kind: KindHello, Payload: []byte("abc")})
 	if err == nil {
 		t.Fatal("WriteFrame: got nil error, want writer's error")
 	}
@@ -205,7 +205,7 @@ func TestWriteFrameWriterError(t *testing.T) {
 
 func encodeFrame(f *testing.F, frame Frame) []byte {
 	var b bytes.Buffer
-	if err := writeFrame(&b, frame); err != nil {
+	if err := WriteFrame(&b, frame); err != nil {
 		f.Fatalf("WriteFrame: %v", err)
 	}
 	return b.Bytes()
@@ -261,7 +261,7 @@ func FuzzReadFrame(f *testing.F) {
 
 		consumed := data[:len(data)-r.Len()]
 		var b bytes.Buffer
-		if err := writeFrame(&b, frame); err != nil {
+		if err := WriteFrame(&b, frame); err != nil {
 			t.Fatalf("WriteFrame: %v", err)
 		}
 
