@@ -21,7 +21,7 @@ func WritePayload(conn net.Conn, k Kind, p encoding.BinaryMarshaler) error {
 		return err
 	}
 
-	return writeFrame(conn, Frame{
+	return WriteFrame(conn, Frame{
 		Kind:    k,
 		Payload: payload,
 	})

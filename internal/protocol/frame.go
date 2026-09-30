@@ -88,7 +88,7 @@ func readHeader(r io.Reader) (Kind, uint32, error) {
 	var header [headerSize]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		if err == io.EOF {
-			return 0, 0, io.EOF
+			return KindInvalid, 0, io.EOF
 		}
 		return KindInvalid, 0, fmt.Errorf("protocol: read header: %w", err)
 	}
@@ -116,18 +116,13 @@ func readPayload(r io.Reader, length uint32) ([]byte, error) {
 	return payload, nil
 }
 
-func writeFrame(w io.Writer, f Frame) error {
-	if !f.Kind.valid() {
-		return fmt.Errorf("%w: kind %d", ErrUnknownKind, f.Kind)
+func WriteFrame(w io.Writer, f Frame) error {
+	if err := f.Validate(); err != nil {
+		return err
 	}
 
-	payloadSize := len(f.Payload)
-	if payloadSize > MaxPayloadSize {
-		return fmt.Errorf("%w: size %d", ErrFrameTooLarge, payloadSize)
-	}
-
-	buf := make([]byte, headerSize+payloadSize)
-	binary.BigEndian.PutUint32(buf[:kindOffset], uint32(payloadSize))
+	buf := make([]byte, headerSize+len(f.Payload))
+	binary.BigEndian.PutUint32(buf[:kindOffset], uint32(len(f.Payload)))
 	buf[kindOffset] = byte(f.Kind)
 	copy(buf[headerSize:], f.Payload)
 
@@ -135,5 +130,16 @@ func writeFrame(w io.Writer, f Frame) error {
 		return fmt.Errorf("protocol: write frame: %w", err)
 	}
 
+	return nil
+}
+
+func (f Frame) Validate() error {
+	if !f.Kind.valid() {
+		return fmt.Errorf("%w: kind %d", ErrUnknownKind, f.Kind)
+	}
+
+	if len(f.Payload) > MaxPayloadSize {
+		return fmt.Errorf("%w: size %d", ErrFrameTooLarge, len(f.Payload))
+	}
 	return nil
 }
