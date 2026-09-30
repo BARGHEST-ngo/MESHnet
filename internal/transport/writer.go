@@ -18,8 +18,8 @@ const DefaultQueueSize = 64
 type Writer struct {
 	conn   io.Writer
 	queue  chan protocol.Frame
-	done   chan struct{}
-	exited chan struct{}
+	done   chan struct{} // closed in Close(), tells run() to stop
+	exited chan struct{} // closed when run() returns
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -62,6 +62,7 @@ func (w *Writer) Close() {
 	<-w.exited
 }
 
+// Why the writer closed
 func (w *Writer) Err() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -76,7 +77,6 @@ func (w *Writer) run() {
 		case <-w.done:
 			return
 		case f := <-w.queue:
-			// Catch invalid frames before writing
 			if err := protocol.WriteFrame(w.conn, f); err != nil {
 				w.mu.Lock()
 				w.err = err
