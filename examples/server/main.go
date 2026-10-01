@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -10,14 +11,21 @@ import (
 )
 
 func main() {
+	verbose := flag.Bool("v", false, "verbose logging (MESHnet and tailcat)")
+	flag.Parse()
+
+	var logf func(format string, args ...any)
+	if *verbose {
+		logf = log.Printf
+	}
 	srv := meshnet.NewServer(meshnet.ServerConfig{
-		Logf: nil,
+		Logf: logf,
 	})
 
 	srv.OnMessage(func(clientID string, m meshnet.Message) {
-		log.Printf("echoing message received from %q: %v", clientID, m)
+		log.Printf("echoing message from %s: %s %q", clientID, m.Topic, m.Data)
 		if err := srv.Send(clientID, m); err != nil {
-			log.Fatal("echoing message: %v", err)
+			log.Fatalf("echoing message: %v", err)
 		}
 	})
 
