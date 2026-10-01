@@ -28,8 +28,11 @@ type tailcatServer interface {
 }
 
 type ServerConfig struct {
-	AllowedClients []string
-	Logf           func(format string, args ...any)
+	AllowedClients       []string
+	Logf                 func(format string, args ...any)
+	OnMessage            func(clientID string, m Message)
+	OnClientConnected    func(c ClientInfo)
+	OnClientDisconnected func(c ClientInfo)
 }
 
 // session is the state for one paired client's connection
@@ -58,7 +61,6 @@ type Server struct {
 
 	cfg        ServerConfig
 	newTailcat func([]key.NodePublic) tailcatServer
-	onMessage  func(clientID string, m Message)
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -69,13 +71,16 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	cfg.AllowedClients = slices.Clone(cfg.AllowedClients)
 
+	if cfg.OnMessage == nil {
+		cfg.OnMessage = func(clientID string, m Message) {}
+	}
+
 	done := make(chan struct{})
 	close(done)
 	s := &Server{
-		done:      done,
-		err:       ErrClosed,
-		cfg:       cfg,
-		onMessage: func(clientID string, m Message) {},
+		done: done,
+		err:  ErrClosed,
+		cfg:  cfg,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
@@ -230,21 +235,6 @@ func (s *Server) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.err
-}
-
-// Register OnMessage handler. nil sets callback as a no-op
-func (s *Server) OnMessage(fn func(clientID string, m Message)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.srv != nil {
-		panic("meshnet: OnMessage called after Start")
-	}
-
-	if fn == nil {
-		fn = func(clientID string, m Message) {}
-	}
-
-	s.onMessage = fn
 }
 
 // Returns the current PIN or empty string if the server isn't running
@@ -427,7 +417,7 @@ func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
 		return err
 	}
 
-	s.onMessage(sess.clientID, Message{Topic: m.Topic, Data: m.Data})
+	s.cfg.OnMessage(sess.clientID, Message{Topic: m.Topic, Data: m.Data})
 	return nil
 }
 

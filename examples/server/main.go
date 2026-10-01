@@ -18,15 +18,16 @@ func main() {
 	if *verbose {
 		logf = log.Printf
 	}
-	srv := meshnet.NewServer(meshnet.ServerConfig{
-		Logf: logf,
-	})
 
-	srv.OnMessage(func(clientID string, m meshnet.Message) {
-		log.Printf("echoing message from %s: %s %q", clientID, m.Topic, m.Data)
-		if err := srv.Send(clientID, m); err != nil {
-			log.Fatalf("echoing message: %v", err)
-		}
+	var srv *meshnet.Server
+	srv = meshnet.NewServer(meshnet.ServerConfig{
+		Logf: logf,
+		OnMessage: func(clientID string, m meshnet.Message) {
+			log.Printf("echoing message from %s: %s %q", clientID, m.Topic, m.Data)
+			if err := srv.Send(clientID, m); err != nil {
+				log.Fatalf("echoing message: %v", err)
+			}
+		},
 	})
 
 	addr, err := srv.Start()

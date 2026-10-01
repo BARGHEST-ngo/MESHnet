@@ -37,10 +37,14 @@ func (f *fakeTailcat) Close() error {
 
 func (f *fakeTailcat) AddAllowedClient(k key.NodePublic) {}
 
-func newTestServer(t *testing.T) (*Server, *fakeTailcat) {
+func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeTailcat) {
 	t.Helper()
 	fake := &fakeTailcat{}
-	s := NewServer(ServerConfig{})
+	cfg := &ServerConfig{}
+	if setup != nil {
+		setup(cfg)
+	}
+	s := NewServer(*cfg)
 	s.newTailcat = func([]key.NodePublic) tailcatServer {
 		return fake
 	}
@@ -66,7 +70,7 @@ func assertOpen(t *testing.T, ch <-chan struct{}) {
 
 func TestServerStartStop(t *testing.T) {
 	t.Run("basic start stop", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		addr, err := s.Start()
 		if err != nil {
 			t.Fatalf("Start: %v", err)
@@ -86,7 +90,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done before start", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		assertClosed(t, s.Done())
 
 		if !errors.Is(s.Err(), ErrClosed) {
@@ -95,7 +99,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done while running", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -104,7 +108,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done after stop", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -120,7 +124,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("start twice", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -132,7 +136,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("stop twice", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -151,7 +155,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("stop before start", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if err := s.Stop(); err != nil {
 			t.Fatalf("stop: %v", err)
 		}
@@ -162,7 +166,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("restart", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -186,7 +190,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("concurrent stop", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -319,7 +323,7 @@ func waitWriter(t *testing.T, s *Server) {
 
 func startNewTestServer(t *testing.T) *Server {
 	t.Helper()
-	s, _ := newTestServer(t)
+	s, _ := newTestServer(t, nil)
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -327,15 +331,15 @@ func startNewTestServer(t *testing.T) *Server {
 }
 
 func TestServerReceiveMessage(t *testing.T) {
-	s, _ := newTestServer(t)
 	type received struct {
 		clientID string
 		m        Message
 	}
-
 	got := make(chan received, 1)
-	s.OnMessage(func(clientID string, m Message) {
-		got <- received{clientID, m}
+	s, _ := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnMessage = func(clientID string, m Message) {
+			got <- received{clientID, m}
+		}
 	})
 
 	if _, err := s.Start(); err != nil {
@@ -438,12 +442,15 @@ func TestServerSendQueueFull(t *testing.T) {
 }
 
 func TestServerOnMessageCanSend(t *testing.T) {
-	s, _ := newTestServer(t)
-	s.OnMessage(func(clientID string, m Message) {
-		if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
-			t.Errorf("Send from callback: %v", err)
+	var s *Server
+	s, _ = newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnMessage = func(clientID string, m Message) {
+			if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
+				t.Errorf("Send from callback: %v", err)
+			}
 		}
 	})
+
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -492,9 +499,11 @@ func TestServerMalformedFrameEndsSession(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _ := newTestServer(t)
 			var called atomic.Bool
-			s.OnMessage(func(string, Message) { called.Store(true) })
+			s, _ := newTestServer(t, func(cfg *ServerConfig) {
+				cfg.OnMessage = func(string, Message) { called.Store(true) }
+			})
+
 			if _, err := s.Start(); err != nil {
 				t.Fatalf("Start: %v", err)
 			}
@@ -565,16 +574,4 @@ func TestServerOnMessageNil(t *testing.T) {
 	}
 
 	assertClosed(t, done)
-}
-
-func TestServerOnMessageAfterStart(t *testing.T) {
-	s := startNewTestServer(t)
-
-	defer func() {
-		if recover() == nil {
-			t.Fatal("OnMessage after start did not panic")
-		}
-	}()
-
-	s.OnMessage(func(clientID string, m Message) {})
 }
