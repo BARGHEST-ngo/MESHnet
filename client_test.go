@@ -15,17 +15,18 @@ import (
 // Returns a Client on a pipe as if Connect has succeeded with the server on the other end.
 // done is closed when the Client readloop exits
 // register callbacks on Client via setup
-func pipeClient(t *testing.T, setup func(c *Client)) (c *Client, server net.Conn, done <-chan struct{}) {
+func pipeClient(t *testing.T, setup func(cfg *ClientConfig)) (c *Client, server net.Conn, done <-chan struct{}) {
 	t.Helper()
 	serverEnd, clientEnd := net.Pipe()
 	deadline := time.Now().Add(2 * time.Second)
 	serverEnd.SetDeadline(deadline)
 	clientEnd.SetDeadline(deadline)
 
-	c = NewClient(ClientConfig{})
+	cfg := &ClientConfig{}
 	if setup != nil {
-		setup(c)
+		setup(cfg)
 	}
+	c = NewClient(*cfg)
 
 	c.mu.Lock()
 	c.used = true
@@ -68,8 +69,8 @@ func TestClientSendMessage(t *testing.T) {
 
 func TestClientReceivesMessage(t *testing.T) {
 	got := make(chan Message, 1) // buffered: the callback runs on readLoop's goroutine
-	_, server, _ := pipeClient(t, func(c *Client) {
-		c.OnMessage(func(m Message) { got <- m })
+	_, server, _ := pipeClient(t, func(cfg *ClientConfig) {
+		cfg.OnMessage = func(m Message) { got <- m }
 	})
 
 	sent := protocol.Msg{Topic: "cmd", Data: []byte{0x00, 0xff}}
@@ -122,12 +123,13 @@ func TestClientSendQueueFull(t *testing.T) {
 }
 
 func TestClientOnMessageCanSend(t *testing.T) {
-	_, server, _ := pipeClient(t, func(c *Client) {
-		c.OnMessage(func(m Message) {
+	var c *Client
+	c, server, _ := pipeClient(t, func(cfg *ClientConfig) {
+		cfg.OnMessage = func(m Message) {
 			if err := c.Send(m); err != nil {
 				t.Errorf("send from callback: %v", err)
 			}
-		})
+		}
 	})
 
 	want := protocol.Msg{Topic: "Darth", Data: []byte("Vader")}
@@ -192,8 +194,8 @@ func TestClientMalformedFrameEndsConnection(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var called atomic.Bool
-			_, server, done := pipeClient(t, func(c *Client) {
-				c.OnMessage(func(Message) { called.Store(true) })
+			_, server, done := pipeClient(t, func(cfg *ClientConfig) {
+				cfg.OnMessage = func(Message) { called.Store(true) }
 			})
 
 			if err := protocol.WriteFrame(server, tc.frame); err != nil {
@@ -220,7 +222,7 @@ func TestClientServerGoneEndsConnection(t *testing.T) {
 }
 
 func TestClientOnMessageNil(t *testing.T) {
-	_, server, done := pipeClient(t, func(c *Client) { c.OnMessage(nil) })
+	_, server, done := pipeClient(t, func(cfg *ClientConfig) { cfg.OnMessage = nil })
 
 	if err := protocol.WritePayload(server, protocol.KindMsg, protocol.Msg{Topic: "hello"}); err != nil {
 		t.Fatalf("write msg: %v", err)
@@ -231,14 +233,4 @@ func TestClientOnMessageNil(t *testing.T) {
 	}
 
 	assertClosed(t, done)
-}
-
-func TestClientOnMessageAfterConnect(t *testing.T) {
-	c, _, _ := pipeClient(t, nil)
-	defer func() {
-		if recover() == nil {
-			t.Fatal("OnMesage after connect did not panic")
-		}
-	}()
-	c.OnMessage(func(m Message) {})
 }

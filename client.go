@@ -21,6 +21,7 @@ type ClientConfig struct {
 	PairingPIN string
 	Name       string
 	Logf       func(format string, args ...any)
+	OnMessage  func(m Message)
 }
 
 type Client struct {
@@ -30,8 +31,7 @@ type Client struct {
 	used   bool // Connect has been called, Clients are single-use
 	writer *transport.Writer
 
-	cfg       ClientConfig
-	onMessage func(m Message)
+	cfg ClientConfig
 }
 
 func NewClient(cfg ClientConfig) *Client {
@@ -40,24 +40,15 @@ func NewClient(cfg ClientConfig) *Client {
 	if cfg.Logf == nil {
 		cfg.Logf = func(format string, args ...any) {}
 	}
+
+	if cfg.OnMessage == nil {
+		cfg.OnMessage = func(m Message) {}
+	}
+
 	c := &Client{
-		cfg:       cfg,
-		onMessage: func(m Message) {},
+		cfg: cfg,
 	}
 	return c
-}
-
-func (c *Client) OnMessage(fn func(m Message)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.used {
-		panic("meshnet: OnMessage called after Connect")
-	}
-
-	if fn == nil {
-		fn = func(m Message) {}
-	}
-	c.onMessage = fn
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -264,7 +255,7 @@ func (c *Client) handleMsg(f protocol.Frame) error {
 		return err
 	}
 
-	c.onMessage(Message{Topic: m.Topic, Data: m.Data})
+	c.cfg.OnMessage(Message{Topic: m.Topic, Data: m.Data})
 	return nil
 }
 

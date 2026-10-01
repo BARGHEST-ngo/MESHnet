@@ -29,15 +29,15 @@ func main() {
 		logf = log.Printf
 	}
 
-	c := meshnet.NewClient(meshnet.ClientConfig{
+	var c *meshnet.Client
+	c = meshnet.NewClient(meshnet.ClientConfig{
 		ServerAddr: *addr,
 		PairingPIN: *pin,
 		Name:       "example client",
 		Logf:       logf,
-	})
-
-	c.OnMessage(func(m meshnet.Message) {
-		log.Printf("received: %s %q", m.Topic, m.Data)
+		OnMessage: func(m meshnet.Message) {
+			log.Printf("received: %s %q", m.Topic, m.Data)
+		},
 	})
 
 	connectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
