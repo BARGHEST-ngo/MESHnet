@@ -536,3 +536,32 @@ func TestStopEndsSession(t *testing.T) {
 	}
 	assertClosed(t, done)
 }
+
+func TestOnMessageNil(t *testing.T) {
+	s := startNewTestServer(t)
+	conn, _, done := connectClient(t, s)
+
+	if err := protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "hello"}); err != nil {
+		t.Fatalf("write msg: %v", err)
+	}
+
+	// handler process frames in order so by the time it handles this close
+	// it has already dispatched the Msg to the no-op callback
+	if err := protocol.WritePayload(conn, protocol.KindClose, protocol.Close{}); err != nil {
+		t.Fatalf("write close: %v", err)
+	}
+
+	assertClosed(t, done)
+}
+
+func TestOnMessageAfterStart(t *testing.T) {
+	s := startNewTestServer(t)
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("OnMessage after start did not panic")
+		}
+	}()
+
+	s.OnMessage(func(clientID string, m Message) {})
+}
