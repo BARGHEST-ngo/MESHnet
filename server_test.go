@@ -465,6 +465,7 @@ func TestOnMessageCanSend(t *testing.T) {
 		t.Errorf("echo = %+v", echo)
 	}
 }
+
 func TestClientCloseEndsSession(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, clientID, done := connectClient(t, s)
@@ -479,23 +480,35 @@ func TestClientCloseEndsSession(t *testing.T) {
 	}
 }
 
-func TestMalformedMsgEndsSession(t *testing.T) {
-	s, _ := newTestServer(t)
-	var called atomic.Bool
-	s.OnMessage(func(string, Message) { called.Store(true) })
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+func TestMalformedFrameEndsSession(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame protocol.Frame
+	}{
+		{name: "malformed msg", frame: protocol.Frame{Kind: protocol.KindMsg, Payload: []byte{0x05, 'h'}}},
+		{name: "malformed close", frame: protocol.Frame{Kind: protocol.KindClose, Payload: []byte{0x02}}},
+		{name: "Hello after handshake", frame: protocol.Frame{Kind: protocol.KindHello, Payload: nil}},
 	}
-	conn, _, done := connectClient(t, s)
 
-	bad := protocol.Frame{Kind: protocol.KindMsg, Payload: []byte{0x05, 'h'}} // topic length past end
-	if err := protocol.WriteFrame(conn, bad); err != nil {
-		t.Fatalf("WriteFrame: %v", err)
-	}
-	assertClosed(t, done)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestServer(t)
+			var called atomic.Bool
+			s.OnMessage(func(string, Message) { called.Store(true) })
+			if _, err := s.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			conn, _, done := connectClient(t, s)
 
-	if called.Load() {
-		t.Error("OnMessage called for a malformed message")
+			if err := protocol.WriteFrame(conn, tc.frame); err != nil {
+				t.Fatalf("WriteFrame: %v", err)
+			}
+			assertClosed(t, done)
+
+			if called.Load() {
+				t.Error("OnMessage called for a malformed message")
+			}
+		})
 	}
 }
 
