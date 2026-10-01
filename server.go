@@ -384,7 +384,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	if reason == protocol.CloseErrNone {
 		sess = &session{
 			conn:     conn,
-			clientID: h.Key,
+			clientID: clientKey.String(),
 		}
 		s.sess = sess
 	}
@@ -404,7 +404,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 
 	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
 		Version:  protocol.Version,
-		ClientID: h.Key,
+		ClientID: clientKey.String(),
 	}); err != nil {
 		s.cfg.Logf("handleShake: %v", err)
 		s.clearSession(sess)
