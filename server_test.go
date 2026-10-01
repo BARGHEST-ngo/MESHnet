@@ -18,8 +18,6 @@ import (
 )
 
 type fakeTailcat struct {
-	startErr   error
-	closeErr   error
 	closeCalls atomic.Int32
 	connected  chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
 }
