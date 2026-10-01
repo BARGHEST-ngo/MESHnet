@@ -1,13 +1,17 @@
 package meshnet
 
 import (
+	"bytes"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
+	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
@@ -259,4 +263,276 @@ func TestParseAllowedClients(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Run handleControl on one end of the pipe and perform handshake from the other side (as the client would)
+func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, done <-chan struct{}) {
+	t.Helper()
+	server, client := net.Pipe()
+	deadline := time.Now().Add(2 * time.Second)
+	server.SetDeadline(deadline)
+	client.SetDeadline(deadline)
+
+	finished := make(chan struct{})
+	go func() {
+		s.handleControl(server)
+		close(finished)
+	}()
+
+	t.Cleanup(func() {
+		client.Close()
+		<-finished
+	})
+
+	clientID = key.NewNode().Public().String()
+	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: "test", PIN: s.PairingPIN()}
+	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	f, err := protocol.ReadFrame(client)
+	if err != nil || f.Kind != protocol.KindHelloAck {
+		t.Fatalf("handshake: kind %v, err %v", f.Kind, err)
+	}
+
+	waitWriter(t, s)
+	return client, clientID, finished
+}
+
+// During tests the server attaches a writer immediately after HelloAck is sent
+// An immediate send could correctly return ErrNotConnected
+// Will be redundant after adding ClientConnected / Disconnected events etc
+func waitWriter(t *testing.T, s *Server) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		ready := s.sess != nil && s.sess.writer != nil
+		s.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("session writer was never created")
+}
+
+func startNewTestServer(t *testing.T) *Server {
+	t.Helper()
+	s, _ := newTestServer(t)
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	return s
+}
+
+func TestReceiveMessage(t *testing.T) {
+	s, _ := newTestServer(t)
+	type received struct {
+		clientID string
+		m        Message
+	}
+
+	got := make(chan received, 1)
+	s.OnMessage(func(clientID string, m Message) {
+		got <- received{clientID, m}
+	})
+
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	conn, clientID, _ := connectClient(t, s)
+	sent := protocol.Msg{Topic: "status", Data: []byte("ok")}
+	if err := protocol.WritePayload(conn, protocol.KindMsg, sent); err != nil {
+		t.Fatalf("write msg: %v", err)
+	}
+
+	select {
+	case r := <-got:
+		if r.clientID != clientID {
+			t.Errorf("clientID is %q, want %q", r.clientID, clientID)
+		}
+
+		if r.m.Topic != sent.Topic || !bytes.Equal(r.m.Data, sent.Data) {
+			t.Errorf("message %+v, want %+v", r.m, sent)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnMessage not called")
+	}
+}
+
+func TestSendMessage(t *testing.T) {
+	s := startNewTestServer(t)
+	conn, clientID, _ := connectClient(t, s)
+
+	want := Message{Topic: "status", Data: []byte("ok")}
+	if err := s.Send(clientID, want); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	f, err := protocol.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if f.Kind != protocol.KindMsg {
+		t.Fatalf("kind = %v, want msg", f.Kind)
+	}
+	var got protocol.Msg
+	if err := got.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Topic != want.Topic || !bytes.Equal(got.Data, want.Data) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestSendErrors(t *testing.T) {
+	t.Run("not connected", func(t *testing.T) {
+		s := startNewTestServer(t)
+		err := s.Send("nodekey:anything", Message{Topic: "t"})
+		if !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("err = %v, want ErrNotConnected", err)
+		}
+	})
+
+	t.Run("unknown client", func(t *testing.T) {
+		s := startNewTestServer(t)
+		connectClient(t, s)
+
+		other := key.NewNode().Public().String()
+		if err := s.Send(other, Message{Topic: "t"}); !errors.Is(err, ErrUnknownClient) {
+			t.Fatalf("err = %v, want ErrUnknownClient", err)
+		}
+	})
+
+	t.Run("invalid message", func(t *testing.T) {
+		s := startNewTestServer(t)
+		_, clientID, _ := connectClient(t, s)
+
+		if err := s.Send(clientID, Message{Topic: ""}); !errors.Is(err, protocol.ErrMalformedPayload) {
+			t.Fatalf("err = %v, want ErrMalformedPayload", err)
+		}
+	})
+}
+
+func TestSendQueueFull(t *testing.T) {
+	s := startNewTestServer(t)
+	_, clientID, _ := connectClient(t, s)
+
+	accepted := 0
+	var err error
+	for accepted <= transport.DefaultQueueSize+1 {
+		if err = s.Send(clientID, Message{Topic: "Darth", Data: []byte("Vader")}); err != nil {
+			break
+		}
+		accepted++
+	}
+
+	if !errors.Is(err, ErrSendQueueFull) {
+		t.Fatalf("after %d sends err: %v, want %v", accepted, err, ErrSendQueueFull)
+	}
+	if accepted < transport.DefaultQueueSize {
+		t.Fatalf("queue full after only %d sends, want at least %d", accepted, transport.DefaultQueueSize)
+	}
+}
+
+func TestOnMessageCanSend(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.OnMessage(func(clientID string, m Message) {
+		if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
+			t.Errorf("Send from callback: %v", err)
+		}
+	})
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, _ := connectClient(t, s)
+
+	if err := protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "ping", Data: []byte("hi")}); err != nil {
+		t.Fatalf("write Msg: %v", err)
+	}
+
+	f, err := protocol.ReadFrame(conn) // a deadlock would show up as a deadline error here
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	var echo protocol.Msg
+	if err := echo.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if echo.Topic != "echo" || string(echo.Data) != "hi" {
+		t.Errorf("echo = %+v", echo)
+	}
+}
+func TestClientCloseEndsSession(t *testing.T) {
+	s := startNewTestServer(t)
+	conn, clientID, done := connectClient(t, s)
+
+	if err := protocol.WritePayload(conn, protocol.KindClose, protocol.Close{}); err != nil {
+		t.Fatalf("write Close: %v", err)
+	}
+	assertClosed(t, done)
+
+	if err := s.Send(clientID, Message{Topic: "t"}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Send after client Close: %v, want ErrNotConnected", err)
+	}
+}
+
+func TestMalformedMsgEndsSession(t *testing.T) {
+	s, _ := newTestServer(t)
+	var called atomic.Bool
+	s.OnMessage(func(string, Message) { called.Store(true) })
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, done := connectClient(t, s)
+
+	bad := protocol.Frame{Kind: protocol.KindMsg, Payload: []byte{0x05, 'h'}} // topic length past end
+	if err := protocol.WriteFrame(conn, bad); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	assertClosed(t, done)
+
+	if called.Load() {
+		t.Error("OnMessage called for a malformed message")
+	}
+}
+
+func TestSessionEndStopsWriter(t *testing.T) {
+	s := startNewTestServer(t)
+	conn, _, done := connectClient(t, s)
+
+	s.mu.Lock()
+	w := s.sess.writer
+	s.mu.Unlock()
+	conn.Close() // client goes away
+	assertClosed(t, done)
+
+	if err := w.Enqueue(protocol.Frame{Kind: protocol.KindMsg, Payload: []byte{0x01, 't'}}); !errors.Is(err, transport.ErrClosed) {
+		t.Errorf("Enqueue after session end: %v, want transport.ErrClosed", err)
+	}
+	s.mu.Lock()
+	sess := s.sess
+	s.mu.Unlock()
+	if sess != nil {
+		t.Error("session still registered after it ended")
+	}
+}
+
+func TestStopEndsSession(t *testing.T) {
+	s := startNewTestServer(t)
+	conn, _, done := connectClient(t, s)
+
+	start := time.Now()
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, err := protocol.ReadFrame(conn); err == nil {
+		t.Fatal("ReadFrame succeeded after Stop")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("client noticed after %v: Stop didn't close the session's conn", elapsed)
+	}
+	assertClosed(t, done)
 }
