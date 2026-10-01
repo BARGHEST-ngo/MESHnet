@@ -1,4 +1,4 @@
-name: Server Tests
+name: Core Tests
 
 on:
   pull_request:
@@ -8,7 +8,7 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
-      - '.github/workflows/server-tests.yml'
+      - '.github/workflows/core-tests.yml'
   push:
     branches: [main]
 
@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   server:
-    name: Server
+    name: Core
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

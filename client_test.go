@@ -121,7 +121,7 @@ func TestClientSendQueueFull(t *testing.T) {
 	}
 }
 
-func TestOnMessageCanSendClient(t *testing.T) {
+func TestClientOnMessageCanSend(t *testing.T) {
 	_, server, _ := pipeClient(t, func(c *Client) {
 		c.OnMessage(func(m Message) {
 			if err := c.Send(m); err != nil {
@@ -154,7 +154,7 @@ func TestOnMessageCanSendClient(t *testing.T) {
 	}
 }
 
-func TestDisconnectTwice(t *testing.T) {
+func TestClientDisconnectTwice(t *testing.T) {
 	c, _, done := pipeClient(t, nil)
 	if err := c.Disconnect(); err != nil {
 		t.Fatalf("disconnect: %v", err)
@@ -219,7 +219,7 @@ func TestClientServerGoneEndsConnection(t *testing.T) {
 	}
 }
 
-func TestOnMessageNilClient(t *testing.T) {
+func TestClientOnMessageNil(t *testing.T) {
 	_, server, done := pipeClient(t, func(c *Client) { c.OnMessage(nil) })
 
 	if err := protocol.WritePayload(server, protocol.KindMsg, protocol.Msg{Topic: "hello"}); err != nil {
@@ -233,7 +233,7 @@ func TestOnMessageNilClient(t *testing.T) {
 	assertClosed(t, done)
 }
 
-func TestOnMessageAfterConnect(t *testing.T) {
+func TestClientOnMessageAfterConnect(t *testing.T) {
 	c, _, _ := pipeClient(t, nil)
 	defer func() {
 		if recover() == nil {
