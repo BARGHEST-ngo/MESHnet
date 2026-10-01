@@ -3,6 +3,7 @@ package meshnet
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -269,6 +270,8 @@ func TestServerParseAllowedClients(t *testing.T) {
 	}
 }
 
+const testClientName = "test"
+
 // Run handleControl on one end of the pipe and perform handshake from the other side (as the client would)
 func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, done <-chan struct{}) {
 	t.Helper()
@@ -289,7 +292,7 @@ func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, don
 	})
 
 	clientID = key.NewNode().Public().String()
-	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: "test", PIN: s.PairingPIN()}
+	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: testClientName, PIN: s.PairingPIN()}
 	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
@@ -574,4 +577,211 @@ func TestServerOnMessageNil(t *testing.T) {
 	}
 
 	assertClosed(t, done)
+}
+
+type disconnectEvent struct {
+	info ClientInfo
+	err  error
+}
+
+// lifecycle records OnClientConnected / OnClientDisconnected calls.
+type lifecycle struct {
+	connected    chan ClientInfo
+	disconnected chan disconnectEvent
+}
+
+func recordLifecycle(cfg *ServerConfig) *lifecycle {
+	l := &lifecycle{
+		connected:    make(chan ClientInfo, 4),
+		disconnected: make(chan disconnectEvent, 4),
+	}
+	cfg.OnClientConnected = func(c ClientInfo) { l.connected <- c }
+	cfg.OnClientDisconnected = func(c ClientInfo, err error) { l.disconnected <- disconnectEvent{c, err} }
+	return l
+}
+
+// next waits for one value from ch, failing the test after a timeout.
+func next[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(time.Second):
+		t.Fatal("callback not called")
+		var zero T
+		return zero
+	}
+}
+
+// none checks nothing more arrives on ch for a short while.
+func none[T any](t *testing.T, ch <-chan T) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("unexpected extra callback: %+v", v)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestServerDisconnectReason(t *testing.T) {
+	cases := []struct {
+		name    string
+		cause   error
+		stopped bool
+		want    error
+	}{
+		{"clean close", clientCloseError{protocol.CloseErrNone}, false, nil},
+		{"close with reason", clientCloseError{protocol.CloseErrError}, false, clientCloseError{protocol.CloseErrError}},
+		{"connection lost", io.EOF, false, io.EOF},
+		{"stopped", io.EOF, true, ErrClosed},
+		{"stopped wins over clean close", clientCloseError{protocol.CloseErrNone}, true, ErrClosed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := disconnectReason(tc.cause, tc.stopped)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("got %v, want nil", got)
+				}
+				return
+			}
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerOnClientConnected(t *testing.T) {
+	var l *lifecycle
+	s, _ := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, clientID, _ := connectClient(t, s)
+
+	got := next(t, l.connected)
+	if got.ID != clientID || got.Name != testClientName {
+		t.Errorf("connected %+v, want ID %q name %q", got, clientID, testClientName)
+	}
+	none(t, l.connected)
+}
+
+func TestServerOnClientConnectedCanSend(t *testing.T) {
+	var s *Server
+	s, _ = newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnClientConnected = func(c ClientInfo) {
+			if err := s.Send(c.ID, Message{Topic: "greeting", Data: []byte("hi")}); err != nil {
+				t.Errorf("Send from OnClientConnected: %v", err)
+			}
+		}
+	})
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, _ := connectClient(t, s)
+
+	f, err := protocol.ReadFrame(conn) // the first frame after HelloAck
+	if err != nil || f.Kind != protocol.KindMsg {
+		t.Fatalf("greeting: kind %v, err %v", f.Kind, err)
+	}
+	var m protocol.Msg
+	if err := m.UnmarshalBinary(f.Payload); err != nil || m.Topic != "greeting" {
+		t.Fatalf("greeting: %+v, err %v", m, err)
+	}
+}
+
+func TestServerOnClientDisconnected(t *testing.T) {
+	cases := []struct {
+		name  string
+		end   func(t *testing.T, s *Server, conn net.Conn)
+		check func(t *testing.T, err error)
+	}{
+		{
+			name: "clean close",
+			end: func(t *testing.T, s *Server, conn net.Conn) {
+				protocol.WritePayload(conn, protocol.KindClose, protocol.Close{})
+			},
+			check: func(t *testing.T, err error) {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			},
+		},
+		{
+			name: "close with reason",
+			end: func(t *testing.T, s *Server, conn net.Conn) {
+				protocol.WritePayload(conn, protocol.KindClose, protocol.Close{Err: protocol.CloseErrError})
+			},
+			check: func(t *testing.T, err error) {
+				var ce clientCloseError
+				if !errors.As(err, &ce) || ce.reason != protocol.CloseErrError {
+					t.Fatalf("err = %v, want clientCloseError(error)", err)
+				}
+			},
+		},
+		{
+			name: "connection lost",
+			end:  func(t *testing.T, s *Server, conn net.Conn) { conn.Close() },
+			check: func(t *testing.T, err error) {
+				if err == nil || errors.Is(err, ErrClosed) {
+					t.Fatalf("err = %v, want a connection error", err)
+				}
+			},
+		},
+		{
+			name: "server stopped",
+			end:  func(t *testing.T, s *Server, conn net.Conn) { s.Stop() },
+			check: func(t *testing.T, err error) {
+				if !errors.Is(err, ErrClosed) {
+					t.Fatalf("err = %v, want ErrClosed", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var l *lifecycle
+			s, _ := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+			if _, err := s.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			conn, clientID, done := connectClient(t, s)
+			next(t, l.connected)
+
+			tc.end(t, s, conn)
+			assertClosed(t, done)
+
+			ev := next(t, l.disconnected)
+			if ev.info.ID != clientID {
+				t.Errorf("disconnected ID %q, want %q", ev.info.ID, clientID)
+			}
+			tc.check(t, ev.err)
+			none(t, l.disconnected) // exactly once
+		})
+	}
+}
+
+func TestServerLifecycleOrder(t *testing.T) {
+	events := make(chan string, 8)
+	s, _ := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnClientConnected = func(ClientInfo) { events <- "connected" }
+		cfg.OnMessage = func(string, Message) { events <- "message" }
+		cfg.OnClientDisconnected = func(ClientInfo, error) { events <- "disconnected" }
+	})
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, done := connectClient(t, s)
+
+	protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "t"})
+	protocol.WritePayload(conn, protocol.KindClose, protocol.Close{})
+	assertClosed(t, done)
+
+	for _, want := range []string{"connected", "message", "disconnected"} {
+		if got := next(t, events); got != want {
+			t.Fatalf("event %q, want %q", got, want)
+		}
+	}
 }
