@@ -3,6 +3,7 @@ package meshnet
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -12,9 +13,12 @@ import (
 	"time"
 
 	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
+	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
+
+var errClientClosed = errors.New("meshnet: client closed")
 
 type tailcatServer interface {
 	Start() error
@@ -35,6 +39,7 @@ type ServerConfig struct {
 type session struct {
 	conn     net.Conn
 	clientID string
+	writer   *transport.Writer
 }
 
 type pairing struct {
@@ -173,6 +178,35 @@ func (s *Server) Stop() error {
 
 // send message to a client
 func (s *Server) Send(clientID string, m Message) error {
+	s.mu.Lock()
+	if s.sess == nil || s.sess.writer == nil {
+		s.mu.Unlock()
+		return ErrNotConnected
+	}
+
+	if s.sess.clientID != clientID {
+		s.mu.Unlock()
+		return ErrUnknownClient
+	}
+	w := s.sess.writer
+	s.mu.Unlock()
+
+	payload, err := protocol.Msg{Topic: m.Topic, Data: m.Data}.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	if err := w.Enqueue(protocol.Frame{Kind: protocol.KindMsg, Payload: payload}); err != nil {
+		if errors.Is(err, transport.ErrFull) {
+			return ErrSendQueueFull
+		}
+
+		if errors.Is(err, transport.ErrClosed) {
+			return ErrNotConnected
+		}
+
+		return err
+	}
 	return nil
 }
 
@@ -261,19 +295,12 @@ func (s *Server) dispatch(port uint16) func(net.Conn) {
 }
 
 func (s *Server) handleControl(conn net.Conn) {
-	defer conn.Close()
 	sess, ok := s.handleShake(conn)
 	if !ok {
+		conn.Close()
 		return
 	}
-
-	defer func() {
-		s.mu.Lock()
-		if s.sess == sess {
-			s.sess = nil
-		}
-		s.mu.Unlock()
-	}()
+	defer s.endSession(sess)
 
 	for {
 		f, err := protocol.ReadFrame(conn)
@@ -283,7 +310,11 @@ func (s *Server) handleControl(conn net.Conn) {
 		}
 
 		if err := s.handleFrame(sess, f); err != nil {
-			s.cfg.Logf("handle frame: %v", err)
+			if errors.Is(err, errClientClosed) {
+				s.cfg.Logf("client closed: %v", err)
+			} else {
+				s.cfg.Logf("handle frame: %v", err)
+			}
 			return
 		}
 	}
@@ -349,6 +380,14 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	default:
 		reason = s.pairing.redeem(h.PIN)
 	}
+
+	if reason == protocol.CloseErrNone {
+		sess = &session{
+			conn:     conn,
+			clientID: clientKey.String(),
+		}
+		s.sess = sess
+	}
 	s.mu.Unlock()
 
 	if reason != protocol.CloseErrNone {
@@ -361,21 +400,21 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		return nil, false
 	}
 
-	sess = &session{
-		conn:     conn,
-		clientID: h.Key,
-	}
-	s.sess = sess
-
 	srv.AddAllowedClient(*clientKey)
 
 	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
 		Version:  protocol.Version,
-		ClientID: h.Key,
+		ClientID: clientKey.String(),
 	}); err != nil {
 		s.cfg.Logf("handleShake: %v", err)
+		s.clearSession(sess)
 		return nil, false
 	}
+
+	w := transport.NewWriter(conn)
+	s.mu.Lock()
+	sess.writer = w
+	s.mu.Unlock()
 
 	conn.SetDeadline(time.Time{})
 
@@ -383,11 +422,44 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
-	// TODO
+	var m protocol.Msg
+	if err := m.UnmarshalBinary(f.Payload); err != nil {
+		return err
+	}
+
+	s.onMessage(sess.clientID, Message{Topic: m.Topic, Data: m.Data})
 	return nil
 }
 
 func (s *Server) handleClose(sess *session, f protocol.Frame) error {
-	// TODO
-	return nil
+	var cl protocol.Close
+	if err := cl.UnmarshalBinary(f.Payload); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %v", errClientClosed, cl.Err)
+}
+
+// tear down a session
+// close the conn and unblock a writer stuck on a dead peer
+// stop the writer and clear it
+func (s *Server) endSession(sess *session) {
+	sess.conn.Close()
+
+	s.mu.Lock()
+	w := sess.writer
+	s.mu.Unlock()
+	if w != nil {
+		w.Close()
+	}
+
+	s.clearSession(sess)
+	s.cfg.Logf("meshnet: client %s disconnected", sess.clientID)
+}
+
+func (s *Server) clearSession(sess *session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sess == sess {
+		s.sess = nil
+	}
 }
