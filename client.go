@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -14,22 +13,23 @@ import (
 	"github.com/tailscale/tailcat"
 )
 
-var errServerClosed = errors.New("meshnet: server closed")
-
 type ClientConfig struct {
-	ServerAddr string
-	PairingPIN string
-	Name       string
-	Logf       func(format string, args ...any)
-	OnMessage  func(m Message)
+	ServerAddr    string
+	PairingPIN    string
+	Name          string
+	Logf          func(format string, args ...any)
+	OnMessage     func(m Message)
+	OnStateChange func(s State, e error)
 }
 
 type Client struct {
-	mu     sync.Mutex // guards all to the line break
-	tc     *tailcat.Client
-	conn   net.Conn
-	used   bool // Connect has been called, Clients are single-use
-	writer *transport.Writer
+	mu       sync.Mutex // guards all to the line break
+	tc       *tailcat.Client
+	conn     net.Conn
+	used     bool // Connect has been called, Clients are single-use
+	writer   *transport.Writer
+	state    State
+	finished bool // final state has been reported, set once
 
 	cfg ClientConfig
 }
@@ -43,6 +43,10 @@ func NewClient(cfg ClientConfig) *Client {
 
 	if cfg.OnMessage == nil {
 		cfg.OnMessage = func(m Message) {}
+	}
+
+	if cfg.OnStateChange == nil {
+		cfg.OnStateChange = func(s State, e error) {}
 	}
 
 	c := &Client{
@@ -61,70 +65,52 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.used = true
 	c.mu.Unlock()
 
+	c.setState(StateConnecting, nil)
+
 	tc := tailcat.NewClient(tailcat.Addr(c.cfg.ServerAddr))
 	tc.Logf = c.cfg.Logf
 
 	conn, err := tc.DialTCPPort(ctx, protocol.ControlPort)
 	if err != nil {
 		tc.Close()
+		c.finish(StateErrored, err)
 		return err
 	}
 
 	if err := c.handshake(ctx, conn, tc); err != nil {
 		conn.Close()
 		tc.Close()
+		c.finish(StateErrored, err)
 		return err
 	}
 
-	w := transport.NewWriter(conn)
-
 	c.mu.Lock()
+	if c.finished { // Disconnect called whilst Connecting
+		c.mu.Unlock()
+		conn.Close()
+		tc.Close()
+		return ErrClosed
+	}
 	c.tc = tc
 	c.conn = conn
-	c.writer = w
+	c.writer = transport.NewWriter(conn)
 	c.mu.Unlock()
 
+	c.setState(StateConnected, nil)
 	go c.readLoop(conn)
-
 	return nil
 }
 
 func (c *Client) Disconnect() error {
 	c.mu.Lock()
-	tc := c.tc
-	conn := c.conn
-	w := c.writer
-
-	if conn == nil && tc == nil {
+	if !c.used || c.finished {
 		c.mu.Unlock()
 		return nil
 	}
-
-	c.tc = nil
-	c.conn = nil
-	c.writer = nil
 	c.mu.Unlock()
 
-	var connErr error
-	if conn != nil {
-		connErr = conn.Close()
-	}
-
-	var tcErr error
-	if tc != nil {
-		tcErr = tc.Close()
-	}
-
-	if w != nil {
-		w.Close()
-	}
-
-	if connErr != nil {
-		return fmt.Errorf("client: disconnect: %w", connErr)
-	}
-	if tcErr != nil {
-		return fmt.Errorf("client: disconnect: %w", tcErr)
-	}
+	c.setState(StateDisconnecting, nil)
+	c.finish(StateDisconnected, nil)
 	return nil
 }
 
@@ -163,6 +149,12 @@ func (c *Client) ID() string {
 		return ""
 	}
 	return c.tc.PublicKey().String()
+}
+
+func (c *Client) State() State {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
 }
 
 func (c *Client) handshake(ctx context.Context, conn net.Conn, tc *tailcat.Client) error {
@@ -214,30 +206,28 @@ func (c *Client) handshake(ctx context.Context, conn net.Conn, tc *tailcat.Clien
 }
 
 func (c *Client) readLoop(conn net.Conn) {
-	defer c.Disconnect()
+	cause := c.serve(conn)
 
+	if errors.Is(cause, ErrServerClosed) {
+		c.cfg.Logf("meshnet: %v", cause)
+		c.finish(StateDisconnected, cause)
+		return
+	}
+	c.cfg.Logf("meshnet: connection lost: %v", cause)
+	c.finish(StateErrored, cause)
+}
+
+func (c *Client) serve(conn net.Conn) error {
 	for {
 		f, err := protocol.ReadFrame(conn)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				c.cfg.Logf("meshnet: server closed the connection")
-			} else {
-				c.cfg.Logf("meshnet: connection lost: %v", err)
-			}
-			return
+			return err // EOF, read error, or our own Disconnect
 		}
-
 		if err := c.handleFrame(f); err != nil {
-			if errors.Is(err, errServerClosed) {
-				c.cfg.Logf("server closed: %v", err)
-			} else {
-				c.cfg.Logf("handle frame: %v", err)
-			}
-			return
+			return err // server Close, malformed or unexpected frame
 		}
 	}
 }
-
 func (c *Client) handleFrame(f protocol.Frame) error {
 	switch f.Kind {
 	case protocol.KindMsg:
@@ -264,5 +254,44 @@ func (c *Client) handleClose(f protocol.Frame) error {
 	if err := cl.UnmarshalBinary(f.Payload); err != nil {
 		return err
 	}
-	return fmt.Errorf("%w: %v", errServerClosed, cl.Err)
+	return fmt.Errorf("%w: %v", ErrServerClosed, cl.Err)
+}
+
+func (c *Client) setState(s State, err error) {
+	c.mu.Lock()
+	c.state = s
+	c.mu.Unlock()
+	c.cfg.OnStateChange(s, err)
+}
+
+func (c *Client) finish(s State, err error) {
+	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		return
+	}
+	c.finished = true
+
+	conn := c.conn
+	w := c.writer
+	tc := c.tc
+
+	c.conn = nil
+	c.writer = nil
+	c.tc = nil
+	c.mu.Unlock()
+
+	if conn != nil {
+		conn.Close()
+	}
+
+	if w != nil {
+		w.Close()
+	}
+
+	if tc != nil {
+		tc.Close()
+	}
+
+	c.setState(s, err)
 }
