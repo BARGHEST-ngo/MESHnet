@@ -11,7 +11,14 @@ import (
 
 func main() {
 	srv := meshnet.NewServer(meshnet.ServerConfig{
-		Logf: log.Printf,
+		Logf: nil,
+	})
+
+	srv.OnMessage(func(clientID string, m meshnet.Message) {
+		log.Printf("echoing message received from %q: %v", clientID, m)
+		if err := srv.Send(clientID, m); err != nil {
+			log.Fatal("echoing message: %v", err)
+		}
 	})
 
 	addr, err := srv.Start()

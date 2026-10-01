@@ -28,8 +28,10 @@ func main() {
 		ServerAddr: *addr,
 		PairingPIN: *pin,
 		Name:       "example client",
-		Logf:       log.Printf,
+		Logf:       nil,
 	})
+
+	c.OnMessage(func(m meshnet.Message) { log.Printf("received: %v", m) })
 
 	connectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -38,6 +40,10 @@ func main() {
 	}
 
 	log.Printf("connected as %s", c.ID())
+
+	if err := c.Send(meshnet.Message{Topic: "test topic", Data: []byte("hello world")}); err != nil {
+		log.Fatal(err)
+	}
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

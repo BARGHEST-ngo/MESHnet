@@ -10,8 +10,11 @@ import (
 	"time"
 
 	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
+	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 	"github.com/tailscale/tailcat"
 )
+
+var errServerClosed = errors.New("meshnet: server closed")
 
 type ClientConfig struct {
 	ServerAddr string
@@ -21,10 +24,11 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	mu   sync.Mutex // guards all to the line break
-	tc   *tailcat.Client
-	conn net.Conn
-	used bool // Connect has been called, Clients are single-use
+	mu     sync.Mutex // guards all to the line break
+	tc     *tailcat.Client
+	conn   net.Conn
+	used   bool // Connect has been called, Clients are single-use
+	writer *transport.Writer
 
 	cfg       ClientConfig
 	onMessage func(m Message)
@@ -47,7 +51,7 @@ func (c *Client) OnMessage(fn func(m Message)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.used {
-		panic("meshnet: OnMessage called after start")
+		panic("meshnet: OnMessage called after Connect")
 	}
 
 	if fn == nil {
@@ -81,9 +85,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
+	w := transport.NewWriter(conn)
+
 	c.mu.Lock()
 	c.tc = tc
 	c.conn = conn
+	c.writer = w
 	c.mu.Unlock()
 
 	go c.readLoop(conn)
@@ -95,6 +102,7 @@ func (c *Client) Disconnect() error {
 	c.mu.Lock()
 	tc := c.tc
 	conn := c.conn
+	w := c.writer
 
 	if conn == nil && tc == nil {
 		c.mu.Unlock()
@@ -103,10 +111,22 @@ func (c *Client) Disconnect() error {
 
 	c.tc = nil
 	c.conn = nil
+	c.writer = nil
 	c.mu.Unlock()
 
-	connErr := conn.Close()
-	tcErr := tc.Close()
+	var connErr error
+	if conn != nil {
+		connErr = conn.Close()
+	}
+
+	var tcErr error
+	if tc != nil {
+		tcErr = tc.Close()
+	}
+
+	if w != nil {
+		w.Close()
+	}
 
 	if connErr != nil {
 		return fmt.Errorf("client: disconnect: %w", connErr)
@@ -118,7 +138,30 @@ func (c *Client) Disconnect() error {
 }
 
 func (c *Client) Send(m Message) error {
-	//TODO
+	c.mu.Lock()
+	if c.writer == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+	w := c.writer
+	c.mu.Unlock()
+
+	payload, err := protocol.Msg{Topic: m.Topic, Data: m.Data}.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	if err := w.Enqueue(protocol.Frame{Kind: protocol.KindMsg, Payload: payload}); err != nil {
+		if errors.Is(err, transport.ErrFull) {
+			return ErrSendQueueFull
+		}
+
+		if errors.Is(err, transport.ErrClosed) {
+			return ErrNotConnected
+		}
+
+		return err
+	}
 	return nil
 }
 
@@ -194,10 +237,41 @@ func (c *Client) readLoop(conn net.Conn) {
 		}
 
 		if err := c.handleFrame(f); err != nil {
-			c.cfg.Logf("meshnet: %v", err)
+			if errors.Is(err, errServerClosed) {
+				c.cfg.Logf("server closed: %v", err)
+			} else {
+				c.cfg.Logf("handle frame: %v", err)
+			}
 			return
 		}
 	}
 }
 
-func (c *Client) handleFrame(f protocol.Frame) error { return nil }
+func (c *Client) handleFrame(f protocol.Frame) error {
+	switch f.Kind {
+	case protocol.KindMsg:
+		return c.handleMsg(f)
+	case protocol.KindClose:
+		return c.handleClose(f)
+	default:
+		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
+	}
+}
+
+func (c *Client) handleMsg(f protocol.Frame) error {
+	var m protocol.Msg
+	if err := m.UnmarshalBinary(f.Payload); err != nil {
+		return err
+	}
+
+	c.onMessage(Message{Topic: m.Topic, Data: m.Data})
+	return nil
+}
+
+func (c *Client) handleClose(f protocol.Frame) error {
+	var cl protocol.Close
+	if err := cl.UnmarshalBinary(f.Payload); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %v", errServerClosed, cl.Err)
+}
