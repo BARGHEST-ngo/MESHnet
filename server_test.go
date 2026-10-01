@@ -64,7 +64,7 @@ func assertOpen(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-func TestStartStop(t *testing.T) {
+func TestServerStartStop(t *testing.T) {
 	t.Run("basic start stop", func(t *testing.T) {
 		s, fake := newTestServer(t)
 		addr, err := s.Start()
@@ -213,7 +213,7 @@ func TestStartStop(t *testing.T) {
 	})
 }
 
-func TestParseAllowedClients(t *testing.T) {
+func TestServerParseAllowedClients(t *testing.T) {
 	k1 := key.NewNode().Public().String()
 	k2 := key.NewNode().Public().String()
 	k3 := key.NewNode().Public().String()
@@ -326,7 +326,7 @@ func startNewTestServer(t *testing.T) *Server {
 	return s
 }
 
-func TestReceiveMessage(t *testing.T) {
+func TestServerReceiveMessage(t *testing.T) {
 	s, _ := newTestServer(t)
 	type received struct {
 		clientID string
@@ -362,7 +362,7 @@ func TestReceiveMessage(t *testing.T) {
 	}
 }
 
-func TestSendMessage(t *testing.T) {
+func TestServerSendMessage(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, clientID, _ := connectClient(t, s)
 
@@ -387,7 +387,7 @@ func TestSendMessage(t *testing.T) {
 	}
 }
 
-func TestSendErrors(t *testing.T) {
+func TestServerSendErrors(t *testing.T) {
 	t.Run("not connected", func(t *testing.T) {
 		s := startNewTestServer(t)
 		err := s.Send("nodekey:anything", Message{Topic: "t"})
@@ -416,7 +416,7 @@ func TestSendErrors(t *testing.T) {
 	})
 }
 
-func TestSendQueueFull(t *testing.T) {
+func TestServerSendQueueFull(t *testing.T) {
 	s := startNewTestServer(t)
 	_, clientID, _ := connectClient(t, s)
 
@@ -437,7 +437,7 @@ func TestSendQueueFull(t *testing.T) {
 	}
 }
 
-func TestOnMessageCanSend(t *testing.T) {
+func TestServerOnMessageCanSend(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.OnMessage(func(clientID string, m Message) {
 		if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
@@ -466,7 +466,7 @@ func TestOnMessageCanSend(t *testing.T) {
 	}
 }
 
-func TestClientCloseEndsSession(t *testing.T) {
+func TestServerClientCloseEndsSession(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, clientID, done := connectClient(t, s)
 
@@ -480,7 +480,7 @@ func TestClientCloseEndsSession(t *testing.T) {
 	}
 }
 
-func TestMalformedFrameEndsSession(t *testing.T) {
+func TestServerMalformedFrameEndsSession(t *testing.T) {
 	cases := []struct {
 		name  string
 		frame protocol.Frame
@@ -512,7 +512,7 @@ func TestMalformedFrameEndsSession(t *testing.T) {
 	}
 }
 
-func TestSessionEndStopsWriter(t *testing.T) {
+func TestServerSessionEndStopsWriter(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, _, done := connectClient(t, s)
 
@@ -533,7 +533,7 @@ func TestSessionEndStopsWriter(t *testing.T) {
 	}
 }
 
-func TestStopEndsSession(t *testing.T) {
+func TestServerStopEndsSession(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, _, done := connectClient(t, s)
 
@@ -550,7 +550,7 @@ func TestStopEndsSession(t *testing.T) {
 	assertClosed(t, done)
 }
 
-func TestOnMessageNil(t *testing.T) {
+func TestServerOnMessageNil(t *testing.T) {
 	s := startNewTestServer(t)
 	conn, _, done := connectClient(t, s)
 
@@ -567,7 +567,7 @@ func TestOnMessageNil(t *testing.T) {
 	assertClosed(t, done)
 }
 
-func TestOnMessageAfterStart(t *testing.T) {
+func TestServerOnMessageAfterStart(t *testing.T) {
 	s := startNewTestServer(t)
 
 	defer func() {

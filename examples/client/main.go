@@ -13,8 +13,9 @@ import (
 
 // First run `go run ./examples/server`
 // Copy the address and pin output
-// `go run ./examples/client -addr '<addr>' -pin <pin>`
+// `go run ./examples/client -addr '<addr>' -pin <pin> [-v]`
 func main() {
+	verbose := flag.Bool("v", false, "verbose logging (MESHnet and tailcat)")
 	addr := flag.String("addr", "", "server address")
 	pin := flag.String("pin", "", "pairing PIN")
 	flag.Parse()
@@ -23,12 +24,20 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	var logf func(format string, args ...any)
+	if *verbose {
+		logf = log.Printf
+	}
 
 	c := meshnet.NewClient(meshnet.ClientConfig{
 		ServerAddr: *addr,
 		PairingPIN: *pin,
 		Name:       "example client",
-		Logf:       log.Printf,
+		Logf:       logf,
+	})
+
+	c.OnMessage(func(m meshnet.Message) {
+		log.Printf("received: %s %q", m.Topic, m.Data)
 	})
 
 	connectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -39,12 +48,16 @@ func main() {
 
 	log.Printf("connected as %s", c.ID())
 
+	if err := c.Send(meshnet.Message{Topic: "test topic", Data: []byte("hello world")}); err != nil {
+		log.Fatal(err)
+	}
+
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	select {
-	case <-sigCtx.Done():
-		if err := c.Disconnect(); err != nil {
-			log.Printf("disconnect: %v", err)
-		}
+	// TODO - also stop when server drops
+	// State change callbacks will handle this
+	<-sigCtx.Done()
+	if err := c.Disconnect(); err != nil {
+		log.Printf("disconnect: %v", err)
 	}
 }
