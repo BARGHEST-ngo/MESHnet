@@ -29,14 +29,23 @@ func main() {
 		logf = log.Printf
 	}
 
-	var c *meshnet.Client
-	c = meshnet.NewClient(meshnet.ClientConfig{
+	ended := make(chan error, 1)
+	c := meshnet.NewClient(meshnet.ClientConfig{
 		ServerAddr: *addr,
 		PairingPIN: *pin,
 		Name:       "example client",
 		Logf:       logf,
 		OnMessage: func(m meshnet.Message) {
 			log.Printf("received: %s %q", m.Topic, m.Data)
+		},
+		OnStateChange: func(s meshnet.State, e error) {
+			log.Printf("state: %v (%v)", s, e)
+			if s == meshnet.StateDisconnected || s == meshnet.StateErrored {
+				select {
+				case ended <- e:
+				default:
+				}
+			}
 		},
 	})
 
@@ -54,10 +63,13 @@ func main() {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	// TODO - also stop when server drops
-	// State change callbacks will handle this
-	<-sigCtx.Done()
-	if err := c.Disconnect(); err != nil {
-		log.Printf("disconnect: %v", err)
+	select {
+	case <-sigCtx.Done():
+		if err := c.Disconnect(); err != nil {
+			log.Printf("disconnect: %v", err)
+		}
+	case err := <-ended:
+		log.Printf("connection ended: %v", err)
+		os.Exit(1)
 	}
 }
