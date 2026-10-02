@@ -11,6 +11,7 @@ import (
 	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
 	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 	"github.com/tailscale/tailcat"
+	"tailscale.com/types/key"
 )
 
 type ClientConfig struct {
@@ -24,14 +25,21 @@ type ClientConfig struct {
 
 type Client struct {
 	mu       sync.Mutex // guards all to the line break
-	tc       *tailcat.Client
+	tc       tailcatClient
 	conn     net.Conn
 	used     bool // Connect has been called, Clients are single-use
 	writer   *transport.Writer
 	state    State
 	finished bool // final state has been reported, set once
 
-	cfg ClientConfig
+	cfg        ClientConfig
+	newTailcat func(cfg ClientConfig) tailcatClient
+}
+
+type tailcatClient interface {
+	DialTCPPort(ctx context.Context, port uint16) (net.Conn, error)
+	PublicKey() key.NodePublic
+	Close() error
 }
 
 func NewClient(cfg ClientConfig) *Client {
@@ -52,7 +60,14 @@ func NewClient(cfg ClientConfig) *Client {
 	c := &Client{
 		cfg: cfg,
 	}
+	c.newTailcat = c.buildTailcat
 	return c
+}
+
+func (c *Client) buildTailcat(cfg ClientConfig) tailcatClient {
+	tc := tailcat.NewClient(tailcat.Addr(cfg.ServerAddr))
+	tc.Logf = cfg.Logf
+	return tc
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -67,8 +82,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.setState(StateConnecting, nil)
 
-	tc := tailcat.NewClient(tailcat.Addr(c.cfg.ServerAddr))
-	tc.Logf = c.cfg.Logf
+	tc := c.newTailcat(c.cfg)
 
 	conn, err := tc.DialTCPPort(ctx, protocol.ControlPort)
 	if err != nil {
@@ -77,7 +91,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
-	if err := c.handshake(ctx, conn, tc); err != nil {
+	if err := c.handshake(ctx, conn, tc.PublicKey().String()); err != nil {
 		conn.Close()
 		tc.Close()
 		c.finish(StateErrored, err)
@@ -157,7 +171,7 @@ func (c *Client) State() State {
 	return c.state
 }
 
-func (c *Client) handshake(ctx context.Context, conn net.Conn, tc *tailcat.Client) error {
+func (c *Client) handshake(ctx context.Context, conn net.Conn, key string) error {
 	deadline := time.Now().Add(10 * (time.Second))
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -169,7 +183,7 @@ func (c *Client) handshake(ctx context.Context, conn net.Conn, tc *tailcat.Clien
 
 	if err := protocol.WritePayload(conn, protocol.KindHello, protocol.Hello{
 		Version: protocol.Version,
-		Key:     tc.PublicKey().String(),
+		Key:     key,
 		Name:    c.cfg.Name,
 		PIN:     c.cfg.PairingPIN,
 	}); err != nil {
@@ -188,7 +202,7 @@ func (c *Client) handshake(ctx context.Context, conn net.Conn, tc *tailcat.Clien
 			return fmt.Errorf("client: handshake: %w", err)
 		}
 
-		if ack.ClientID != tc.PublicKey().String() {
+		if ack.ClientID != key {
 			return fmt.Errorf("unexpected clientID received")
 		}
 
