@@ -389,30 +389,81 @@ func TestClientConnectRejected(t *testing.T) {
 }
 
 func TestClientDisconnectDuringConnect(t *testing.T) {
-	c, _, server, states := fakeConnect(t, nil)
-	helloRead := make(chan struct{})
-	goServer(t, server, func() {
-		protocol.ReadFrame(server) // read the Hello, but never reply
-		close(helloRead)
+	// Disconnect while Connect waits for the ack, then the handshake fails:
+	// Connect returns through the handshake error path
+	t.Run("server then closes", func(t *testing.T) {
+		c, _, server, states := fakeConnect(t, nil)
+		helloRead := make(chan struct{})
+		goServer(t, server, func() {
+			protocol.ReadFrame(server) // read the Hello, but never reply
+			close(helloRead)
+		})
+
+		result := make(chan error, 1)
+		go func() { result <- c.Connect(context.Background()) }()
+
+		<-helloRead
+		c.Disconnect() // while Connect waits for the ack
+		// Disconnect's finish closes nothing (conn isn't stored yet), so release
+		// Connect by failing its read: close the server end.
+		server.Close()
+
+		if err := <-result; err == nil {
+			t.Fatal("Connect succeeded after Disconnect")
+		}
+		for _, ev := range drain(states) {
+			if ev.state == StateConnected {
+				t.Fatal("reported Connected after Disconnect")
+			}
+		}
 	})
 
-	result := make(chan error, 1)
-	go func() { result <- c.Connect(context.Background()) }()
+	// Disconnect while Connect waits for the ack and then the handshake succeeds:
+	// Connect must notice finished before storing the connection.
+	t.Run("server then accepts", func(t *testing.T) {
+		c, fake, server, states := fakeConnect(t, nil)
+		helloRead := make(chan struct{})
+		disconnected := make(chan struct{})
+		goServer(t, server, func() {
+			f, err := protocol.ReadFrame(server)
+			if err != nil {
+				t.Errorf("read Hello: %v", err)
+				return
+			}
+			var h protocol.Hello
+			if err := h.UnmarshalBinary(f.Payload); err != nil {
+				t.Errorf("unmarshal Hello: %v", err)
+				return
+			}
+			close(helloRead)
+			<-disconnected // reply only after the client has been told to disconnect
+			protocol.WritePayload(server, protocol.KindHelloAck, protocol.HelloAck{Version: protocol.Version, ClientID: h.Key})
+		})
 
-	<-helloRead
-	c.Disconnect() // while Connect waits for the ack
-	// Disconnect's finish closes nothing (conn isn't stored yet), so release
-	// Connect by failing its read: close the server end.
-	server.Close()
+		result := make(chan error, 1)
+		go func() { result <- c.Connect(context.Background()) }()
 
-	if err := <-result; err == nil {
-		t.Fatal("Connect succeeded after Disconnect")
-	}
-	for _, ev := range drain(states) {
-		if ev.state == StateConnected {
-			t.Fatal("reported Connected after Disconnect")
+		<-helloRead
+		c.Disconnect()
+		close(disconnected)
+
+		if err := <-result; !errors.Is(err, ErrClosed) {
+			t.Fatalf("Connect err = %v, want ErrClosed", err)
 		}
-	}
+
+		if !fake.closed.Load() {
+			t.Error("tailcat client not closed")
+		}
+
+		for _, ev := range drain(states) {
+			if ev.state == StateConnected {
+				t.Fatal("reported Connected after Disconnect")
+			}
+		}
+		if err := c.Send(Message{Topic: "t"}); !errors.Is(err, ErrNotConnected) {
+			t.Errorf("Send after Disconnect: %v, want ErrNotConnected", err)
+		}
+	})
 }
 
 func TestClientConnectDialFails(t *testing.T) {
