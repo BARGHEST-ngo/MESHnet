@@ -5,10 +5,6 @@ import (
 	"time"
 )
 
-// These will be merged with the Server OnClientConenct/Disconnect
-// Duplicating here for now so Client tests can pass
-// Will remove when merging main to this branch after Server PR is closed
-
 // next waits for one value from ch, failing the test after a timeout.
 func next[T any](t *testing.T, ch <-chan T) T {
 	t.Helper()
