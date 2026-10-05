@@ -594,29 +594,6 @@ func recordLifecycle(cfg *ServerConfig) *lifecycle {
 	return l
 }
 
-// next waits for one value from ch, failing the test after a timeout.
-func next[T any](t *testing.T, ch <-chan T) T {
-	t.Helper()
-	select {
-	case v := <-ch:
-		return v
-	case <-time.After(time.Second):
-		t.Fatal("callback not called")
-		var zero T
-		return zero
-	}
-}
-
-// none checks nothing more arrives on ch for a short while.
-func none[T any](t *testing.T, ch <-chan T) {
-	t.Helper()
-	select {
-	case v := <-ch:
-		t.Fatalf("unexpected extra callback: %+v", v)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
 func TestServerDisconnectReason(t *testing.T) {
 	cases := []struct {
 		name    string
