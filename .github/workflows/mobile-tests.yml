@@ -6,6 +6,7 @@ on:
     paths:
       - 'mobile/**'
       - 'internal/**'
+      - 'scripts/build-aar.sh'
       - '*.go'
       - 'go.mod'
       - 'go.sum'
@@ -34,9 +35,6 @@ jobs:
         run: go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Bind smoke test
         env:
+          TARGET: android/arm64
           ANDROID_NDK_HOME: ${{env.ANDROID_NDK_LATEST_HOME}}
-        run: >
-          go tool gomobile bind
-          -target android/arm64 -androidapi 26
-          -javapkg org.barghest.meshnet
-          -o meshnet.aar ./mobile
+        run: scripts/build-aar.sh

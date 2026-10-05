@@ -23,6 +23,7 @@ go.work.sum
 *.jar
 *.xcframework/
 *.framework/
+build/
 
 # Env / secrets
 .env
