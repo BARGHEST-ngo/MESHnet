@@ -22,23 +22,25 @@ type Client struct {
 	c *meshnet.Client
 }
 
-func NewClient(serverAddr, pairingPIN, name string, l Listener) *Client {
+func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.ClientConfig {
 	if l == nil {
 		l = noopListener{}
 	}
-	return &Client{
-		c: meshnet.NewClient(meshnet.ClientConfig{
-			ServerAddr: serverAddr,
-			PairingPIN: pairingPIN,
-			Name:       name,
-			OnMessage: func(m meshnet.Message) {
-				l.OnMessage(m.Topic, m.Data)
-			},
-			OnStateChange: func(s meshnet.State, e error) {
-				l.OnStateChange(s.String(), errString(e))
-			},
-		}),
+	return meshnet.ClientConfig{
+		ServerAddr: serverAddr,
+		PairingPIN: pairingPIN,
+		Name:       name,
+		OnMessage: func(m meshnet.Message) {
+			l.OnMessage(m.Topic, m.Data)
+		},
+		OnStateChange: func(s meshnet.State, e error) {
+			l.OnStateChange(s.String(), errString(e))
+		},
 	}
+}
+
+func NewClient(serverAddr, pairingPIN, name string, l Listener) *Client {
+	return &Client{c: meshnet.NewClient(clientConfig(serverAddr, pairingPIN, name, l))}
 }
 
 func (c *Client) Connect() error {

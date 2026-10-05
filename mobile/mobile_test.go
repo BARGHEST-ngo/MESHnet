@@ -1,6 +1,7 @@
 package meshnetmobile
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -9,21 +10,24 @@ import (
 )
 
 type stateCall struct{ state, err string }
-
+type messageCall struct {
+	topic string
+	data  []byte
+}
 type recorder struct {
 	states   chan stateCall
-	messages chan string
+	messages chan messageCall
 }
 
 func newRecorder() *recorder {
 	return &recorder{
 		states:   make(chan stateCall, 8),
-		messages: make(chan string, 8),
+		messages: make(chan messageCall, 8),
 	}
 }
 
 func (r *recorder) OnMessage(topic string, data []byte) {
-	r.messages <- topic + ":" + string(data)
+	r.messages <- messageCall{topic: topic, data: data}
 }
 
 func (r *recorder) OnStateChange(state, err string) {
@@ -117,5 +121,36 @@ func TestClientNilListener(t *testing.T) {
 	// Connect reports state changes; with a nil Listener these must not panic.
 	if err := c.Connect(); err == nil {
 		t.Fatal("Connect to a bad address succeeded")
+	}
+}
+
+func TestClientConfigOnMessage(t *testing.T) {
+	r := newRecorder()
+	cfg := clientConfig("addr", "123456", "test", r)
+
+	cfg.OnMessage(meshnet.Message{Topic: "status", Data: []byte{0x00, 0xff, 'x'}})
+
+	select {
+	case m := <-r.messages:
+		if m.topic != "status" || !bytes.Equal(m.data, []byte{0x00, 0xff, 'x'}) {
+			t.Errorf("got %q % x, want status 00 ff 78", m.topic, m.data)
+		}
+	default:
+		t.Fatal("Listener.OnMessage not called")
+	}
+}
+
+func TestClientConfigOnStateChange(t *testing.T) {
+	r := newRecorder()
+	cfg := clientConfig("addr", "123456", "test", r)
+
+	cfg.OnStateChange(meshnet.StateConnected, nil)
+	cfg.OnStateChange(meshnet.StateErrored, errors.New("boom"))
+
+	if s := nextState(t, r); s != (stateCall{"Connected", ""}) {
+		t.Errorf("first state %+v, want {Connected, \"\"}", s)
+	}
+	if s := nextState(t, r); s != (stateCall{"Errored", "boom"}) {
+		t.Errorf("second state %+v, want {Errored, boom}", s)
 	}
 }
