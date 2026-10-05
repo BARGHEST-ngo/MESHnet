@@ -1,0 +1,39 @@
+name: Mobile Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'mobile/**'
+      - 'internal/**'
+      - 'scripts/build-aar.sh'
+      - '*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/mobile-tests.yml'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:  
+  mobile:
+    name: Mobile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./mobile
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./mobile
+      - name: Coverage
+        run: go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Bind smoke test
+        env:
+          TARGET: android/arm64
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-aar.sh
