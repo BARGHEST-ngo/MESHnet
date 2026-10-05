@@ -36,5 +36,4 @@ jobs:
       - name: Bind smoke test
         env:
           TARGET: android/arm64
-          ANDROID_NDK_HOME: ${{env.ANDROID_NDK_LATEST_HOME}}
-        run: scripts/build-aar.sh
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-aar.sh
