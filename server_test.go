@@ -3,6 +3,7 @@ package meshnet
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 type fakeTailcat struct {
 	closeCalls atomic.Int32
+	connected  chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
 }
 
 const fakeAddress = "fake-address"
@@ -37,13 +39,24 @@ func (f *fakeTailcat) Close() error {
 
 func (f *fakeTailcat) AddAllowedClient(k key.NodePublic) {}
 
-func newTestServer(t *testing.T) (*Server, *fakeTailcat) {
+func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeTailcat) {
 	t.Helper()
-	fake := &fakeTailcat{}
-	s := NewServer(ServerConfig{})
-	s.newTailcat = func([]key.NodePublic) tailcatServer {
-		return fake
+	fake := &fakeTailcat{connected: make(chan string, 4)}
+	cfg := &ServerConfig{}
+	if setup != nil {
+		setup(cfg)
 	}
+
+	appConnected := cfg.OnClientConnected // the test's own callback, may be nil
+	cfg.OnClientConnected = func(c ClientInfo) {
+		if appConnected != nil {
+			appConnected(c)
+		}
+		fake.connected <- c.ID
+	}
+
+	s := NewServer(*cfg)
+	s.newTailcat = func([]key.NodePublic) tailcatServer { return fake }
 	return s, fake
 }
 
@@ -66,7 +79,7 @@ func assertOpen(t *testing.T, ch <-chan struct{}) {
 
 func TestServerStartStop(t *testing.T) {
 	t.Run("basic start stop", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		addr, err := s.Start()
 		if err != nil {
 			t.Fatalf("Start: %v", err)
@@ -86,7 +99,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done before start", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		assertClosed(t, s.Done())
 
 		if !errors.Is(s.Err(), ErrClosed) {
@@ -95,7 +108,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done while running", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -104,7 +117,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("done after stop", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -120,7 +133,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("start twice", func(t *testing.T) {
-		s, _ := newTestServer(t)
+		s, _ := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -132,7 +145,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("stop twice", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -151,7 +164,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("stop before start", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if err := s.Stop(); err != nil {
 			t.Fatalf("stop: %v", err)
 		}
@@ -162,7 +175,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("restart", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -186,7 +199,7 @@ func TestServerStartStop(t *testing.T) {
 	})
 
 	t.Run("concurrent stop", func(t *testing.T) {
-		s, fake := newTestServer(t)
+		s, fake := newTestServer(t, nil)
 		if _, err := s.Start(); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -265,8 +278,10 @@ func TestServerParseAllowedClients(t *testing.T) {
 	}
 }
 
+const testClientName = "test"
+
 // Run handleControl on one end of the pipe and perform handshake from the other side (as the client would)
-func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, done <-chan struct{}) {
+func connectClient(t *testing.T, s *Server, fake *fakeTailcat) (conn net.Conn, clientID string, done <-chan struct{}) {
 	t.Helper()
 	server, client := net.Pipe()
 	deadline := time.Now().Add(2 * time.Second)
@@ -285,7 +300,7 @@ func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, don
 	})
 
 	clientID = key.NewNode().Public().String()
-	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: "test", PIN: s.PairingPIN()}
+	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: testClientName, PIN: s.PairingPIN()}
 	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
@@ -295,54 +310,40 @@ func connectClient(t *testing.T, s *Server) (conn net.Conn, clientID string, don
 		t.Fatalf("handshake: kind %v, err %v", f.Kind, err)
 	}
 
-	waitWriter(t, s)
+	select {
+	case <-fake.connected:
+	case <-time.After(time.Second):
+		t.Fatal("OnClientConnected never fired")
+	}
 	return client, clientID, finished
 }
 
-// During tests the server attaches a writer immediately after HelloAck is sent
-// An immediate send could correctly return ErrNotConnected
-// Will be redundant after adding ClientConnected / Disconnected events etc
-func waitWriter(t *testing.T, s *Server) {
+func startNewTestServer(t *testing.T) (*Server, *fakeTailcat) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		ready := s.sess != nil && s.sess.writer != nil
-		s.mu.Unlock()
-		if ready {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("session writer was never created")
-}
-
-func startNewTestServer(t *testing.T) *Server {
-	t.Helper()
-	s, _ := newTestServer(t)
+	s, f := newTestServer(t, nil)
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	return s
+	return s, f
 }
 
 func TestServerReceiveMessage(t *testing.T) {
-	s, _ := newTestServer(t)
 	type received struct {
 		clientID string
 		m        Message
 	}
-
 	got := make(chan received, 1)
-	s.OnMessage(func(clientID string, m Message) {
-		got <- received{clientID, m}
+	s, fake := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnMessage = func(clientID string, m Message) {
+			got <- received{clientID, m}
+		}
 	})
 
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 
-	conn, clientID, _ := connectClient(t, s)
+	conn, clientID, _ := connectClient(t, s, fake)
 	sent := protocol.Msg{Topic: "status", Data: []byte("ok")}
 	if err := protocol.WritePayload(conn, protocol.KindMsg, sent); err != nil {
 		t.Fatalf("write msg: %v", err)
@@ -363,8 +364,8 @@ func TestServerReceiveMessage(t *testing.T) {
 }
 
 func TestServerSendMessage(t *testing.T) {
-	s := startNewTestServer(t)
-	conn, clientID, _ := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	conn, clientID, _ := connectClient(t, s, fake)
 
 	want := Message{Topic: "status", Data: []byte("ok")}
 	if err := s.Send(clientID, want); err != nil {
@@ -389,7 +390,7 @@ func TestServerSendMessage(t *testing.T) {
 
 func TestServerSendErrors(t *testing.T) {
 	t.Run("not connected", func(t *testing.T) {
-		s := startNewTestServer(t)
+		s, _ := startNewTestServer(t)
 		err := s.Send("nodekey:anything", Message{Topic: "t"})
 		if !errors.Is(err, ErrNotConnected) {
 			t.Fatalf("err = %v, want ErrNotConnected", err)
@@ -397,8 +398,8 @@ func TestServerSendErrors(t *testing.T) {
 	})
 
 	t.Run("unknown client", func(t *testing.T) {
-		s := startNewTestServer(t)
-		connectClient(t, s)
+		s, fake := startNewTestServer(t)
+		connectClient(t, s, fake)
 
 		other := key.NewNode().Public().String()
 		if err := s.Send(other, Message{Topic: "t"}); !errors.Is(err, ErrUnknownClient) {
@@ -407,8 +408,8 @@ func TestServerSendErrors(t *testing.T) {
 	})
 
 	t.Run("invalid message", func(t *testing.T) {
-		s := startNewTestServer(t)
-		_, clientID, _ := connectClient(t, s)
+		s, fake := startNewTestServer(t)
+		_, clientID, _ := connectClient(t, s, fake)
 
 		if err := s.Send(clientID, Message{Topic: ""}); !errors.Is(err, protocol.ErrMalformedPayload) {
 			t.Fatalf("err = %v, want ErrMalformedPayload", err)
@@ -417,8 +418,8 @@ func TestServerSendErrors(t *testing.T) {
 }
 
 func TestServerSendQueueFull(t *testing.T) {
-	s := startNewTestServer(t)
-	_, clientID, _ := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	_, clientID, _ := connectClient(t, s, fake)
 
 	accepted := 0
 	var err error
@@ -438,16 +439,19 @@ func TestServerSendQueueFull(t *testing.T) {
 }
 
 func TestServerOnMessageCanSend(t *testing.T) {
-	s, _ := newTestServer(t)
-	s.OnMessage(func(clientID string, m Message) {
-		if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
-			t.Errorf("Send from callback: %v", err)
+	var s *Server
+	s, fake := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnMessage = func(clientID string, m Message) {
+			if err := s.Send(clientID, Message{Topic: "echo", Data: m.Data}); err != nil {
+				t.Errorf("Send from callback: %v", err)
+			}
 		}
 	})
+
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	conn, _, _ := connectClient(t, s)
+	conn, _, _ := connectClient(t, s, fake)
 
 	if err := protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "ping", Data: []byte("hi")}); err != nil {
 		t.Fatalf("write Msg: %v", err)
@@ -467,8 +471,8 @@ func TestServerOnMessageCanSend(t *testing.T) {
 }
 
 func TestServerClientCloseEndsSession(t *testing.T) {
-	s := startNewTestServer(t)
-	conn, clientID, done := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	conn, clientID, done := connectClient(t, s, fake)
 
 	if err := protocol.WritePayload(conn, protocol.KindClose, protocol.Close{}); err != nil {
 		t.Fatalf("write Close: %v", err)
@@ -492,13 +496,15 @@ func TestServerMalformedFrameEndsSession(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _ := newTestServer(t)
 			var called atomic.Bool
-			s.OnMessage(func(string, Message) { called.Store(true) })
+			s, fake := newTestServer(t, func(cfg *ServerConfig) {
+				cfg.OnMessage = func(string, Message) { called.Store(true) }
+			})
+
 			if _, err := s.Start(); err != nil {
 				t.Fatalf("Start: %v", err)
 			}
-			conn, _, done := connectClient(t, s)
+			conn, _, done := connectClient(t, s, fake)
 
 			if err := protocol.WriteFrame(conn, tc.frame); err != nil {
 				t.Fatalf("WriteFrame: %v", err)
@@ -513,8 +519,8 @@ func TestServerMalformedFrameEndsSession(t *testing.T) {
 }
 
 func TestServerSessionEndStopsWriter(t *testing.T) {
-	s := startNewTestServer(t)
-	conn, _, done := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	conn, _, done := connectClient(t, s, fake)
 
 	s.mu.Lock()
 	w := s.sess.writer
@@ -534,8 +540,8 @@ func TestServerSessionEndStopsWriter(t *testing.T) {
 }
 
 func TestServerStopEndsSession(t *testing.T) {
-	s := startNewTestServer(t)
-	conn, _, done := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	conn, _, done := connectClient(t, s, fake)
 
 	start := time.Now()
 	if err := s.Stop(); err != nil {
@@ -551,8 +557,8 @@ func TestServerStopEndsSession(t *testing.T) {
 }
 
 func TestServerOnMessageNil(t *testing.T) {
-	s := startNewTestServer(t)
-	conn, _, done := connectClient(t, s)
+	s, fake := startNewTestServer(t)
+	conn, _, done := connectClient(t, s, fake)
 
 	if err := protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "hello"}); err != nil {
 		t.Fatalf("write msg: %v", err)
@@ -567,14 +573,209 @@ func TestServerOnMessageNil(t *testing.T) {
 	assertClosed(t, done)
 }
 
-func TestServerOnMessageAfterStart(t *testing.T) {
-	s := startNewTestServer(t)
+type disconnectEvent struct {
+	info ClientInfo
+	err  error
+}
 
-	defer func() {
-		if recover() == nil {
-			t.Fatal("OnMessage after start did not panic")
+// lifecycle records OnClientConnected / OnClientDisconnected calls.
+type lifecycle struct {
+	connected    chan ClientInfo
+	disconnected chan disconnectEvent
+}
+
+func recordLifecycle(cfg *ServerConfig) *lifecycle {
+	l := &lifecycle{
+		connected:    make(chan ClientInfo, 4),
+		disconnected: make(chan disconnectEvent, 4),
+	}
+	cfg.OnClientConnected = func(c ClientInfo) { l.connected <- c }
+	cfg.OnClientDisconnected = func(c ClientInfo, err error) { l.disconnected <- disconnectEvent{c, err} }
+	return l
+}
+
+// next waits for one value from ch, failing the test after a timeout.
+func next[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(time.Second):
+		t.Fatal("callback not called")
+		var zero T
+		return zero
+	}
+}
+
+// none checks nothing more arrives on ch for a short while.
+func none[T any](t *testing.T, ch <-chan T) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("unexpected extra callback: %+v", v)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestServerDisconnectReason(t *testing.T) {
+	cases := []struct {
+		name    string
+		cause   error
+		stopped bool
+		want    error
+	}{
+		{"clean close", clientCloseError{protocol.CloseErrNone}, false, nil},
+		{"close with reason", clientCloseError{protocol.CloseErrError}, false, clientCloseError{protocol.CloseErrError}},
+		{"connection lost", io.EOF, false, io.EOF},
+		{"stopped", io.EOF, true, ErrClosed},
+		{"stopped wins over clean close", clientCloseError{protocol.CloseErrNone}, true, ErrClosed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := disconnectReason(tc.cause, tc.stopped)
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("got %v, want nil", got)
+				}
+				return
+			}
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerOnClientConnected(t *testing.T) {
+	var l *lifecycle
+	s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, clientID, _ := connectClient(t, s, fake)
+
+	got := next(t, l.connected)
+	if got.ID != clientID || got.Name != testClientName {
+		t.Errorf("connected %+v, want ID %q name %q", got, clientID, testClientName)
+	}
+	none(t, l.connected)
+}
+
+func TestServerOnClientConnectedCanSend(t *testing.T) {
+	var s *Server
+	s, fake := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnClientConnected = func(c ClientInfo) {
+			if err := s.Send(c.ID, Message{Topic: "greeting", Data: []byte("hi")}); err != nil {
+				t.Errorf("Send from OnClientConnected: %v", err)
+			}
 		}
-	}()
+	})
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, _ := connectClient(t, s, fake)
 
-	s.OnMessage(func(clientID string, m Message) {})
+	f, err := protocol.ReadFrame(conn) // the first frame after HelloAck
+	if err != nil || f.Kind != protocol.KindMsg {
+		t.Fatalf("greeting: kind %v, err %v", f.Kind, err)
+	}
+	var m protocol.Msg
+	if err := m.UnmarshalBinary(f.Payload); err != nil || m.Topic != "greeting" {
+		t.Fatalf("greeting: %+v, err %v", m, err)
+	}
+}
+
+func TestServerOnClientDisconnected(t *testing.T) {
+	cases := []struct {
+		name  string
+		end   func(t *testing.T, s *Server, conn net.Conn)
+		check func(t *testing.T, err error)
+	}{
+		{
+			name: "clean close",
+			end: func(t *testing.T, s *Server, conn net.Conn) {
+				protocol.WritePayload(conn, protocol.KindClose, protocol.Close{})
+			},
+			check: func(t *testing.T, err error) {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			},
+		},
+		{
+			name: "close with reason",
+			end: func(t *testing.T, s *Server, conn net.Conn) {
+				protocol.WritePayload(conn, protocol.KindClose, protocol.Close{Err: protocol.CloseErrError})
+			},
+			check: func(t *testing.T, err error) {
+				var ce clientCloseError
+				if !errors.As(err, &ce) || ce.reason != protocol.CloseErrError {
+					t.Fatalf("err = %v, want clientCloseError(error)", err)
+				}
+			},
+		},
+		{
+			name: "connection lost",
+			end:  func(t *testing.T, s *Server, conn net.Conn) { conn.Close() },
+			check: func(t *testing.T, err error) {
+				if err == nil || errors.Is(err, ErrClosed) {
+					t.Fatalf("err = %v, want a connection error", err)
+				}
+			},
+		},
+		{
+			name: "server stopped",
+			end:  func(t *testing.T, s *Server, conn net.Conn) { s.Stop() },
+			check: func(t *testing.T, err error) {
+				if !errors.Is(err, ErrClosed) {
+					t.Fatalf("err = %v, want ErrClosed", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var l *lifecycle
+			s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+			if _, err := s.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			conn, clientID, done := connectClient(t, s, fake)
+			next(t, l.connected)
+
+			tc.end(t, s, conn)
+			assertClosed(t, done)
+
+			ev := next(t, l.disconnected)
+			if ev.info.ID != clientID {
+				t.Errorf("disconnected ID %q, want %q", ev.info.ID, clientID)
+			}
+			tc.check(t, ev.err)
+			none(t, l.disconnected) // exactly once
+		})
+	}
+}
+
+func TestServerLifecycleOrder(t *testing.T) {
+	events := make(chan string, 8)
+	s, fake := newTestServer(t, func(cfg *ServerConfig) {
+		cfg.OnClientConnected = func(ClientInfo) { events <- "connected" }
+		cfg.OnMessage = func(string, Message) { events <- "message" }
+		cfg.OnClientDisconnected = func(ClientInfo, error) { events <- "disconnected" }
+	})
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	conn, _, done := connectClient(t, s, fake)
+
+	protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "t"})
+	protocol.WritePayload(conn, protocol.KindClose, protocol.Close{})
+	assertClosed(t, done)
+
+	for _, want := range []string{"connected", "message", "disconnected"} {
+		if got := next(t, events); got != want {
+			t.Fatalf("event %q, want %q", got, want)
+		}
+	}
 }
