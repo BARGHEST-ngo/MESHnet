@@ -11,6 +11,10 @@ type Listener interface {
 	OnMessage(topic string, data []byte)
 	OnStateChange(state string, err string)
 }
+type noopListener struct{}
+
+func (noopListener) OnMessage(topic string, data []byte)    {}
+func (noopListener) OnStateChange(state string, err string) {}
 
 const connectTimeout = 30 * time.Second
 
@@ -19,6 +23,9 @@ type Client struct {
 }
 
 func NewClient(serverAddr, pairingPIN, name string, l Listener) *Client {
+	if l == nil {
+		l = noopListener{}
+	}
 	return &Client{
 		c: meshnet.NewClient(meshnet.ClientConfig{
 			ServerAddr: serverAddr,
