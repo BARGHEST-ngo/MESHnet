@@ -11,19 +11,19 @@ import (
 type stateCall struct{ state, err string }
 
 type recorder struct {
-	states    chan stateCall
-	messanges chan string
+	states   chan stateCall
+	messages chan string
 }
 
 func newRecorder() *recorder {
 	return &recorder{
-		states:    make(chan stateCall, 8),
-		messanges: make(chan string, 8),
+		states:   make(chan stateCall, 8),
+		messages: make(chan string, 8),
 	}
 }
 
 func (r *recorder) OnMessage(topic string, data []byte) {
-	r.messanges <- topic + ":" + string(data)
+	r.messages <- topic + ":" + string(data)
 }
 
 func (r *recorder) OnStateChange(state, err string) {
