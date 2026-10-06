@@ -10,13 +10,16 @@ import (
 type Kind uint8
 
 const (
-	KindInvalid  Kind = iota
-	KindHello         // client > server: identify and pair
-	KindHelloAck      // server > client: handshake accepted
-	KindMsg           // application message
-	KindPing          // alive check
-	KindPong          // response to ping
-	KindClose         // closing, with a reason
+	KindInvalid       Kind = iota
+	KindHello              // client > server: identify and pair
+	KindHelloAck           // server > client: handshake accepted
+	KindMsg                // application message
+	KindPing               // alive check
+	KindPong               // response to ping
+	KindClose              // closing, with a reason
+	KindStreamRequest      // request a stream
+
+	kindEnd
 )
 
 func (k Kind) String() string {
@@ -35,13 +38,15 @@ func (k Kind) String() string {
 		return "pong"
 	case KindClose:
 		return "close"
+	case KindStreamRequest:
+		return "stream-request"
 	default:
 		return fmt.Sprintf("[%d] unknown-kind", k)
 	}
 }
 
 func (k Kind) valid() bool {
-	return k >= KindHello && k <= KindClose
+	return k >= KindHello && k < kindEnd
 }
 
 const (
