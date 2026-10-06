@@ -217,3 +217,37 @@ func TestWriterWriteError(t *testing.T) {
 		t.Fatalf("enqueue after write error = %v, want ErrClosed", err)
 	}
 }
+
+func TestWriterDone(t *testing.T) {
+	t.Run("closed by Close", func(t *testing.T) {
+		conn, _ := pipe(t)
+		w := NewWriter(conn)
+
+		select {
+		case <-w.Done():
+			t.Fatal("Done closed while the writer is running")
+		default:
+		}
+
+		w.Close()
+		select {
+		case <-w.Done():
+		default:
+			t.Fatal("Done still open after Close")
+		}
+	})
+
+	t.Run("closed by a write error", func(t *testing.T) {
+		w := NewWriter(failWriter{err: errors.New("boom")})
+		defer w.Close()
+
+		if err := w.Enqueue(frame(1)); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		select {
+		case <-w.Done():
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("Done still open after a write error")
+		}
+	})
+}

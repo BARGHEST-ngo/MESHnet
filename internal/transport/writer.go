@@ -69,6 +69,10 @@ func (w *Writer) Err() error {
 	return w.err
 }
 
+func (w *Writer) Done() <-chan struct{} {
+	return w.exited
+}
+
 func (w *Writer) run() {
 	defer close(w.exited)
 

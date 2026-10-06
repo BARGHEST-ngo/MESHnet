@@ -32,8 +32,10 @@ type Client struct {
 	state    State
 	finished bool // final state has been reported, set once
 
-	cfg        ClientConfig
-	newTailcat func(cfg ClientConfig) tailcatClient
+	cfg             ClientConfig
+	newTailcat      func(cfg ClientConfig) tailcatClient
+	pingInterval    time.Duration
+	livenessTimeout time.Duration
 }
 
 type tailcatClient interface {
@@ -58,7 +60,9 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 
 	c := &Client{
-		cfg: cfg,
+		cfg:             cfg,
+		pingInterval:    pingInterval,
+		livenessTimeout: defaultLivenessTimeout,
 	}
 	c.newTailcat = c.buildTailcat
 	return c
@@ -107,11 +111,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.tc = tc
 	c.conn = conn
-	c.writer = transport.NewWriter(conn)
+	w := transport.NewWriter(conn)
+	c.writer = w
 	c.mu.Unlock()
 
 	c.setState(StateConnected, nil)
 	go c.readLoop(conn)
+	go c.pingLoop(w)
 	return nil
 }
 
@@ -231,11 +237,31 @@ func (c *Client) readLoop(conn net.Conn) {
 	c.finish(StateErrored, cause)
 }
 
-func (c *Client) serve(conn net.Conn) error {
+func (c *Client) pingLoop(w *transport.Writer) {
+	t := time.NewTicker(c.pingInterval)
+	defer t.Stop()
 	for {
-		f, err := protocol.ReadFrame(conn)
+		select {
+		case <-w.Done():
+			return
+		case <-t.C:
+			err := w.Enqueue(protocol.Frame{Kind: protocol.KindPing})
+			if err != nil && !errors.Is(err, transport.ErrFull) {
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) serve(conn net.Conn) error {
+	r := deadlineReader{
+		conn:    conn,
+		timeout: c.livenessTimeout,
+	}
+	for {
+		f, err := protocol.ReadFrame(r)
 		if err != nil {
-			return err // EOF, read error, or our own Disconnect
+			return timeoutErr(err) // EOF, read error, timeout, or our own Disconnect
 		}
 		if err := c.handleFrame(f); err != nil {
 			return err // server Close, malformed or unexpected frame
@@ -248,6 +274,8 @@ func (c *Client) handleFrame(f protocol.Frame) error {
 		return c.handleMsg(f)
 	case protocol.KindClose:
 		return c.handleClose(f)
+	case protocol.KindPong:
+		return c.handlePong(f)
 	default:
 		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
 	}
@@ -269,6 +297,13 @@ func (c *Client) handleClose(f protocol.Frame) error {
 		return err
 	}
 	return fmt.Errorf("%w: %v", ErrServerClosed, cl.Err)
+}
+
+func (c *Client) handlePong(f protocol.Frame) error {
+	if len(f.Payload) != 0 {
+		return fmt.Errorf("pong: %w", protocol.ErrMalformedPayload)
+	}
+	return nil
 }
 
 func (c *Client) setState(s State, err error) {
