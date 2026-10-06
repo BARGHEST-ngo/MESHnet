@@ -31,6 +31,7 @@ type ServerConfig struct {
 	OnMessage            func(clientID string, m Message)
 	OnClientConnected    func(c ClientInfo)
 	OnClientDisconnected func(c ClientInfo, e error)
+	LivenessTimeout      time.Duration // Minimum 20s
 }
 
 // session is the state for one paired client's connection
@@ -79,6 +80,14 @@ func NewServer(cfg ServerConfig) *Server {
 
 	if cfg.OnClientDisconnected == nil {
 		cfg.OnClientDisconnected = func(c ClientInfo, e error) {}
+	}
+
+	switch {
+	case cfg.LivenessTimeout == 0:
+		cfg.LivenessTimeout = defaultLivenessTimeout
+
+	case cfg.LivenessTimeout < 2*pingInterval:
+		cfg.LivenessTimeout = 2 * pingInterval
 	}
 
 	done := make(chan struct{})
@@ -303,10 +312,14 @@ func (s *Server) handleControl(conn net.Conn) {
 }
 
 func (s *Server) serve(sess *session) error {
+	r := deadlineReader{
+		conn:    sess.conn,
+		timeout: s.cfg.LivenessTimeout,
+	}
 	for {
-		f, err := protocol.ReadFrame(sess.conn)
+		f, err := protocol.ReadFrame(r)
 		if err != nil {
-			return err // EOF, closed or broken connection
+			return timeoutErr(err)
 		}
 
 		if err := s.handleFrame(sess, f); err != nil {
@@ -321,9 +334,8 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 		return s.handleMsg(sess, f)
 	case protocol.KindClose:
 		return s.handleClose(sess, f)
-	// TODO:
-	//case protocol.KindPing:
-	//case protocol.KindPong:
+	case protocol.KindPing:
+		return s.handlePing(sess, f)
 	default:
 		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
 	}
@@ -331,7 +343,7 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 
 // TODO - If the server starts with a pre-approved list of client keys, the PIN is not required
 // but this handshake handler currently demands one
-// Not needed in our existing use-case for MESHnet so will come abck to that one...
+// Not needed in our existing use-case for MESHnet so will come back to that one...
 func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
@@ -426,6 +438,19 @@ func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
 	}
 
 	s.cfg.OnMessage(sess.clientInfo.ID, Message{Topic: m.Topic, Data: m.Data})
+	return nil
+}
+
+func (s *Server) handlePing(sess *session, f protocol.Frame) error {
+	if len(f.Payload) != 0 {
+		return fmt.Errorf("ping: %w", protocol.ErrMalformedPayload)
+	}
+
+	err := sess.writer.Enqueue(protocol.Frame{Kind: protocol.KindPong})
+	if err != nil && !errors.Is(err, transport.ErrFull) {
+		return fmt.Errorf("ping: %w", err)
+	}
+	// Full queue is fine, queued frames are traffic
 	return nil
 }
 
