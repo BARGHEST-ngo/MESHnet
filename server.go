@@ -248,9 +248,7 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 		err = enqueueErr(w.Enqueue(protocol.Frame{Kind: protocol.KindStreamRequest, Payload: payload}))
 	}
 	if err != nil {
-		s.mu.Lock()
-		delete(sess.pending, id)
-		s.mu.Unlock()
+		s.dropPendingStream(sess, id)
 		return nil, err
 	}
 
@@ -258,9 +256,7 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	case conn := <-ch:
 		return conn, nil
 	case <-ctx.Done():
-		s.mu.Lock()
-		delete(sess.pending, id)
-		s.mu.Unlock()
+		s.dropPendingStream(sess, id)
 		select { // the handler may have delivered just before we dropped it
 		case conn := <-ch:
 			conn.Close()
@@ -268,11 +264,15 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 		}
 		return nil, ctx.Err()
 	case <-w.Done():
-		s.mu.Lock()
-		delete(sess.pending, id)
-		s.mu.Unlock()
+		s.dropPendingStream(sess, id)
 		return nil, ErrNotConnected
 	}
+}
+
+func (s *Server) dropPendingStream(sess *session, id uint64) {
+	s.mu.Lock()
+	delete(sess.pending, id)
+	s.mu.Unlock()
 }
 
 func enqueueErr(err error) error {
