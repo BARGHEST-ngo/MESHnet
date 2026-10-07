@@ -225,7 +225,7 @@ func FuzzReadFrame(f *testing.F) {
 		rawHeader(3, KindMsg),
 		append(rawHeader(3, KindMsg), 'a'), //partial payload
 		rawHeader(0, KindInvalid),
-		rawHeader(0, KindClose+1),
+		rawHeader(0, kindEnd),
 		rawHeader(0, 255),
 		rawHeader(MaxPayloadSize, KindMsg),
 		rawHeader(MaxPayloadSize+1, KindMsg),

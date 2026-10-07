@@ -3,105 +3,16 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"strings"
 )
 
 const (
-	PINLength     = 6
-	MaxNameLen    = 64
-	MaxMessageLen = 255
+	PINLength  = 6
+	MaxNameLen = 64
 
-	keyPrefix     = "nodekey:"
-	keyLen        = len(keyPrefix) + 64 //32 byte key hex-encoded
-	uint16Size    = 2
-	strPrefixSize = 1
-	closeErrSize  = 1
+	keyPrefix = "nodekey:"
+	keyLen    = len(keyPrefix) + 64 //32 byte key hex-encoded
 )
-
-type CloseErr uint8
-
-const (
-	CloseErrNone CloseErr = iota
-	CloseErrVersionMismatch
-	CloseErrWrongPIN
-	CloseErrPairingLocked
-	CloseErrInvalidKey
-	CloseErrError
-)
-
-func (e CloseErr) String() string {
-	switch e {
-	case CloseErrNone:
-		return "none"
-	case CloseErrVersionMismatch:
-		return "version_mismatch"
-	case CloseErrWrongPIN:
-		return "wrong_pin"
-	case CloseErrPairingLocked:
-		return "pairing_locked"
-	case CloseErrInvalidKey:
-		return "invalid_key"
-	case CloseErrError:
-		return "error"
-	default:
-		return fmt.Sprintf("[%d] unknown error", e)
-	}
-}
-
-type Close struct {
-	Err     CloseErr
-	Message string
-}
-
-func (c Close) validate() error {
-	if len(c.Message) > MaxMessageLen {
-		return fmt.Errorf("%w: message length %d exceeds %d", ErrMalformedPayload, len(c.Message), MaxMessageLen)
-	}
-	return nil
-}
-
-func (c Close) MarshalBinary() ([]byte, error) {
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
-
-	b := make([]byte, 0)
-	b = append(b, byte(c.Err))
-	b, err := appendString(b, c.Message)
-	if err != nil {
-		return nil, err
-	}
-
-	return b, nil
-}
-
-func (c *Close) UnmarshalBinary(b []byte) error {
-	if len(b) < closeErrSize {
-		return fmt.Errorf("%w: missing close error code", ErrMalformedPayload)
-	}
-
-	closeErr := CloseErr(b[0])
-	msg, remaining, err := readString(b[closeErrSize:])
-	if err != nil {
-		return err
-	}
-
-	if len(remaining) != 0 {
-		return fmt.Errorf("%w: %d trailing bytes", ErrMalformedPayload, len(remaining))
-	}
-
-	decoded := Close{
-		Err:     closeErr,
-		Message: msg,
-	}
-	if err := decoded.validate(); err != nil {
-		return err
-	}
-
-	*c = decoded
-	return nil
-}
 
 type Hello struct {
 	Version uint16
@@ -265,37 +176,4 @@ func validateKey(field, s string) error {
 		return fmt.Errorf("%w: %s missing %q prefix", ErrMalformedPayload, field, keyPrefix)
 	}
 	return nil
-}
-
-// Appends one uint8 length prefixed string to b
-func appendString(b []byte, s string) ([]byte, error) {
-	if len(s) > math.MaxUint8 {
-		return b, fmt.Errorf("%w: string length %d exceeds %d", ErrMalformedPayload, len(s), math.MaxUint8)
-	}
-
-	b = append(b, byte(len(s)))
-	b = append(b, s...)
-	return b, nil
-}
-
-// Reads one uint8 length prefixed string from the front of b and returns it with the unread bytes
-func readString(b []byte) (string, []byte, error) {
-	if len(b) == 0 {
-		return "", nil, fmt.Errorf("%w: missing string length", ErrMalformedPayload)
-	}
-
-	n := int(b[0])
-	remaining := b[strPrefixSize:]
-	if len(remaining) < n {
-		return "", nil, fmt.Errorf("%w: string length %d exceeds %d remaining bytes", ErrMalformedPayload, n, len(remaining))
-	}
-
-	return string(remaining[:n]), remaining[n:], nil
-}
-
-func readUint16(b []byte) (uint16, []byte, error) {
-	if len(b) < uint16Size {
-		return 0, nil, fmt.Errorf("%w: need %d bytes for uint16, got %d", ErrMalformedPayload, uint16Size, len(b))
-	}
-	return binary.BigEndian.Uint16(b), b[uint16Size:], nil
 }

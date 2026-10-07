@@ -140,6 +140,46 @@ func TestReadUint16(t *testing.T) {
 	}
 }
 
+func TestReadUint64(t *testing.T) {
+	cases := []struct {
+		name          string
+		in            []byte
+		want          uint64
+		wantRemaining []byte
+		err           error
+	}{
+		{name: "empty", in: nil, err: ErrMalformedPayload},
+		{name: "seven bytes", in: make([]byte, 7), err: ErrMalformedPayload},
+		{name: "exact", in: u64(1), want: 1},
+		{name: "max value", in: u64(math.MaxUint64), want: math.MaxUint64},
+		{name: "remainder", in: join(u64(1), []byte{0xaa}), want: 1, wantRemaining: []byte{0xaa}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, remaining, err := readUint64(tc.in)
+			if tc.err != nil {
+				if !errors.Is(err, tc.err) {
+					t.Errorf("expected %v, got %v", tc.err, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tc.want != got {
+				t.Errorf("expected %d, got %d", tc.want, got)
+			}
+
+			if !bytes.Equal(remaining, tc.wantRemaining) {
+				t.Errorf("remaining = % x, want % x", remaining, tc.wantRemaining)
+			}
+		})
+	}
+}
+
 func TestRoundTripClose(t *testing.T) {
 	cases := []struct {
 		name string
