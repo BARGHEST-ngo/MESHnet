@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -16,13 +17,23 @@ import (
 )
 
 type fakeTailcatClient struct {
-	key     key.NodePublic
-	conn    net.Conn
-	dialErr error
-	closed  atomic.Bool
+	key           key.NodePublic
+	conn          net.Conn
+	dialErr       error
+	closed        atomic.Bool
+	streams       chan net.Conn
+	streamDialErr error
 }
 
-func (f *fakeTailcatClient) DialTCPPort(context.Context, uint16) (net.Conn, error) {
+func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Conn, error) {
+	if port == protocol.StreamPort {
+		if f.streamDialErr != nil {
+			return nil, f.streamDialErr
+		}
+		server, client := net.Pipe()
+		f.streams <- server
+		return client, nil
+	}
 	if f.dialErr != nil {
 		return nil, f.dialErr
 	}
@@ -67,7 +78,11 @@ func fakeConnect(t *testing.T, setup func(cfg *ClientConfig)) (c *Client, fake *
 		states <- stateEvent{s, err}
 	}
 
-	fake = &fakeTailcatClient{key: key.NewNode().Public(), conn: clientEnd}
+	fake = &fakeTailcatClient{
+		key:     key.NewNode().Public(),
+		conn:    clientEnd,
+		streams: make(chan net.Conn, 8),
+	}
 	c = NewClient(*cfg)
 	c.newTailcat = func(ClientConfig) tailcatClient { return fake }
 	t.Cleanup(func() { c.Disconnect() })
@@ -564,5 +579,92 @@ func TestClientSendOnConnected(t *testing.T) {
 	var m protocol.Msg
 	if err := m.UnmarshalBinary(f.Payload); err != nil || m.Topic != "hello" {
 		t.Fatalf("message %+v, err %v", m, err)
+	}
+}
+
+func TestClientStreamRequestOpensStream(t *testing.T) {
+	_, fake, server, _ := connected(t, nil)
+	req := protocol.StreamRequest{
+		ID:     4,
+		Target: "5555",
+	}
+
+	if err := protocol.WritePayload(server, protocol.KindStreamRequest, req); err != nil {
+		t.Fatalf("write streamRequest: %v", err)
+	}
+
+	stream := next(t, fake.streams)
+	t.Cleanup(func() { stream.Close() })
+
+	id, err := protocol.ReadStreamID(stream)
+	if err != nil {
+		t.Fatalf("read stream ID: %v", err)
+	}
+	if id != 4 {
+		t.Errorf("stream ID %d, want 4", id)
+	}
+}
+
+type streamCall struct {
+	target string
+	stream net.Conn
+}
+
+func TestClientStreamRequestHandler(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	_, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+
+	req := protocol.StreamRequest{
+		ID:     4,
+		Target: "5555",
+	}
+	if err := protocol.WritePayload(server, protocol.KindStreamRequest, req); err != nil {
+		t.Fatalf("write streamRequest: %v", err)
+	}
+
+	serverEnd := next(t, fake.streams)
+	t.Cleanup(func() { serverEnd.Close() })
+	if _, err := protocol.ReadStreamID(serverEnd); err != nil {
+		t.Fatalf("read frame ID: %v", err)
+	}
+
+	call := next(t, calls)
+	t.Cleanup(func() { call.stream.Close() })
+	if call.target != "5555" {
+		t.Fatalf("handler target %q, want 5555", call.target)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	serverEnd.SetDeadline(deadline)
+	call.stream.SetDeadline(deadline)
+
+	for _, dir := range []struct {
+		name     string
+		from, to net.Conn
+	}{
+		{name: "client to server", from: call.stream, to: serverEnd},
+		{name: "server to client", from: serverEnd, to: call.stream},
+	} {
+		want := []byte(dir.name)
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := dir.from.Write(want)
+			wrote <- err
+		}()
+
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(dir.to, got); err != nil {
+			t.Fatalf("%s: read: %v", dir.name, err)
+		}
+		if err := <-wrote; err != nil {
+			t.Fatalf("%s: write: %v", dir.name, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("%s: got %q, want %q", dir.name, want, got)
+		}
 	}
 }
