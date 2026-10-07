@@ -15,12 +15,13 @@ import (
 )
 
 type ClientConfig struct {
-	ServerAddr    string
-	PairingPIN    string
-	Name          string
-	Logf          func(format string, args ...any)
-	OnMessage     func(m Message)
-	OnStateChange func(s State, e error)
+	ServerAddr      string
+	PairingPIN      string
+	Name            string
+	Logf            func(format string, args ...any)
+	OnMessage       func(m Message)                      // defaults to noop
+	OnStateChange   func(s State, e error)               // defaults to noop
+	OnStreamRequest func(target string, stream net.Conn) // default refuses all requests
 }
 
 type Client struct {
@@ -31,6 +32,7 @@ type Client struct {
 	writer   *transport.Writer
 	state    State
 	finished bool // final state has been reported, set once
+	streams  []net.Conn
 
 	cfg             ClientConfig
 	newTailcat      func(cfg ClientConfig) tailcatClient
@@ -57,6 +59,10 @@ func NewClient(cfg ClientConfig) *Client {
 
 	if cfg.OnStateChange == nil {
 		cfg.OnStateChange = func(s State, e error) {}
+	}
+
+	if cfg.OnStreamRequest == nil {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) { stream.Close() }
 	}
 
 	c := &Client{
@@ -304,6 +310,55 @@ func (c *Client) handlePong(f protocol.Frame) error {
 		return fmt.Errorf("pong: %w", protocol.ErrMalformedPayload)
 	}
 	return nil
+}
+
+// TODO: Cap total open streams, a hostile server could send mass requests
+func (c *Client) handleStreamRequest(f protocol.Frame) error {
+	var req protocol.StreamRequest
+	if err := req.UnmarshalBinary(f.Payload); err != nil {
+		return err
+	}
+
+	go c.openStream(req)
+	return nil
+}
+
+const streamOpenTimeout = 10 * time.Second
+
+func (c *Client) openStream(req protocol.StreamRequest) {
+	c.mu.Lock()
+	tc := c.tc
+	c.mu.Unlock()
+
+	if tc == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), streamOpenTimeout)
+	defer cancel()
+	stream, err := tc.DialTCPPort(ctx, protocol.StreamPort)
+	if err != nil {
+		c.cfg.Logf("meshnet: stream request %d: dial: %v", req.ID, err)
+		return
+	}
+
+	stream.SetWriteDeadline(time.Now().Add(streamOpenTimeout))
+	if err := protocol.WriteStreamID(stream, req.ID); err != nil {
+		c.cfg.Logf("meshnet: stream request %d: write id: %v", req.ID, err)
+		stream.Close()
+		return
+	}
+	stream.SetWriteDeadline(time.Time{})
+
+	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		stream.Close()
+		return
+	}
+	c.streams = append(c.streams, stream)
+	c.mu.Unlock()
+	c.cfg.OnStreamRequest(req.Target, stream)
 }
 
 func (c *Client) setState(s State, err error) {
