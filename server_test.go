@@ -2,6 +2,7 @@ package meshnet
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -754,5 +755,171 @@ func TestServerLifecycleOrder(t *testing.T) {
 		if got := next(t, events); got != want {
 			t.Fatalf("event %q, want %q", got, want)
 		}
+	}
+}
+
+type streamResult struct {
+	conn net.Conn
+	err  error
+}
+
+// goRequestStream runs RequestStream in the background and reports its result.
+func goRequestStream(ctx context.Context, s *Server, clientID, target string) <-chan streamResult {
+	res := make(chan streamResult, 1)
+	go func() {
+		conn, err := s.RequestStream(ctx, clientID, target)
+		res <- streamResult{conn, err}
+	}()
+	return res
+}
+
+// readStreamRequest reads the next frame from the client's end and decodes it.
+func readStreamRequest(t *testing.T, conn net.Conn) protocol.StreamRequest {
+	t.Helper()
+	f, err := protocol.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if f.Kind != protocol.KindStreamRequest {
+		t.Fatalf("got %v frame, want %v", f.Kind, protocol.KindStreamRequest)
+	}
+	var r protocol.StreamRequest
+	if err := r.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("decode StreamRequest: %v", err)
+	}
+	return r
+}
+
+func pendingStreams(s *Server) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sess == nil {
+		return 0
+	}
+	return len(s.sess.pending)
+}
+
+func TestServerRequestStreamErrors(t *testing.T) {
+	t.Run("no client connected", func(t *testing.T) {
+		s, _ := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+
+		_, err := s.RequestStream(context.Background(), "nodekey:anyone", "5555")
+		if !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("got %v, want ErrNotConnected", err)
+		}
+	})
+
+	t.Run("unknown client", func(t *testing.T) {
+		s, fake := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+		connectClient(t, s, fake)
+
+		_, err := s.RequestStream(context.Background(), "nodekey:someone-else", "5555")
+		if !errors.Is(err, ErrUnknownClient) {
+			t.Fatalf("got %v, want ErrUnknownClient", err)
+		}
+		if n := pendingStreams(s); n != 0 {
+			t.Fatalf("%d pending requests, want 0", n)
+		}
+	})
+
+	for _, tc := range []struct{ name, target string }{
+		{"empty target", ""},
+		{"target too long", strings.Repeat("a", 256)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := startNewTestServer(t)
+			t.Cleanup(func() { s.Stop() })
+			_, clientID, _ := connectClient(t, s, fake)
+
+			_, err := s.RequestStream(context.Background(), clientID, tc.target)
+			if !errors.Is(err, protocol.ErrMalformedPayload) {
+				t.Fatalf("got %v, want ErrMalformedPayload", err)
+			}
+			if n := pendingStreams(s); n != 0 {
+				t.Fatalf("%d pending requests, want 0", n)
+			}
+		})
+	}
+}
+
+func TestServerRequestStreamSendsFrame(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	conn, clientID, _ := connectClient(t, s, fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := goRequestStream(ctx, s, clientID, "5555")
+	if r := readStreamRequest(t, conn); r.ID != 1 || r.Target != "5555" {
+		t.Fatalf("first request %+v, want ID 1 target 5555", r)
+	}
+
+	second := goRequestStream(ctx, s, clientID, "capture")
+	if r := readStreamRequest(t, conn); r.ID != 2 || r.Target != "capture" {
+		t.Fatalf("second request %+v, want ID 2 target capture", r)
+	}
+
+	if n := pendingStreams(s); n != 2 {
+		t.Fatalf("%d pending requests, want 2", n)
+	}
+
+	// Nothing answers, so both wait until the caller gives up.
+	cancel()
+	for _, res := range []<-chan streamResult{first, second} {
+		if r := next(t, res); !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", r.err)
+		}
+	}
+	if n := pendingStreams(s); n != 0 {
+		t.Fatalf("%d pending requests after cancel, want 0", n)
+	}
+}
+
+func TestServerRequestStreamContextExpires(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	_, clientID, _ := connectClient(t, s, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	conn, err := s.RequestStream(ctx, clientID, "5555")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+	if conn != nil {
+		t.Fatalf("got a stream with an error")
+	}
+	if n := pendingStreams(s); n != 0 {
+		t.Fatalf("%d pending requests, want 0", n)
+	}
+}
+
+func TestServerRequestStreamSessionEnds(t *testing.T) {
+	cases := []struct {
+		name string
+		end  func(s *Server, conn net.Conn)
+	}{
+		{"client drops", func(_ *Server, conn net.Conn) { conn.Close() }},
+		{"server stops", func(s *Server, _ net.Conn) { s.Stop() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := startNewTestServer(t)
+			t.Cleanup(func() { s.Stop() })
+			conn, clientID, _ := connectClient(t, s, fake)
+
+			res := goRequestStream(context.Background(), s, clientID, "5555")
+			readStreamRequest(t, conn) // the request is out and waiting
+
+			tc.end(s, conn)
+
+			if r := next(t, res); !errors.Is(r.err, ErrNotConnected) {
+				t.Fatalf("got %v, want ErrNotConnected", r.err)
+			}
+		})
 	}
 }
