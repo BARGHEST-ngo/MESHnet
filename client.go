@@ -282,6 +282,8 @@ func (c *Client) handleFrame(f protocol.Frame) error {
 		return c.handleClose(f)
 	case protocol.KindPong:
 		return c.handlePong(f)
+	case protocol.KindStreamRequest:
+		return c.handleStreamRequest(f)
 	default:
 		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
 	}
@@ -379,10 +381,12 @@ func (c *Client) finish(s State, err error) {
 	conn := c.conn
 	w := c.writer
 	tc := c.tc
+	streams := c.streams
 
 	c.conn = nil
 	c.writer = nil
 	c.tc = nil
+	c.streams = nil
 	c.mu.Unlock()
 
 	if conn != nil {
@@ -391,6 +395,10 @@ func (c *Client) finish(s State, err error) {
 
 	if w != nil {
 		w.Close()
+	}
+
+	for _, stream := range streams {
+		stream.Close()
 	}
 
 	if tc != nil {
