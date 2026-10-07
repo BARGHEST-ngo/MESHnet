@@ -1,6 +1,7 @@
 package meshnet
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"errors"
@@ -39,9 +40,12 @@ type ServerConfig struct {
 // per-client state will live here (writer queue, liveness, streams)
 // currently one per server run
 type session struct {
-	conn       net.Conn
-	clientInfo ClientInfo
-	writer     *transport.Writer
+	conn         net.Conn
+	clientInfo   ClientInfo
+	writer       *transport.Writer
+	nextStreamID uint64
+	pending      map[uint64]chan net.Conn
+	streams      []net.Conn
 }
 
 type pairing struct {
@@ -216,18 +220,71 @@ func (s *Server) Send(clientID string, m Message) error {
 		return err
 	}
 
-	if err := w.Enqueue(protocol.Frame{Kind: protocol.KindMsg, Payload: payload}); err != nil {
-		if errors.Is(err, transport.ErrFull) {
-			return ErrSendQueueFull
-		}
+	return enqueueErr(w.Enqueue(protocol.Frame{Kind: protocol.KindMsg, Payload: payload}))
+}
 
-		if errors.Is(err, transport.ErrClosed) {
-			return ErrNotConnected
-		}
-
-		return err
+func (s *Server) RequestStream(ctx context.Context, clientID, target string) (net.Conn, error) {
+	s.mu.Lock()
+	sess := s.sess
+	if sess == nil || sess.writer == nil {
+		s.mu.Unlock()
+		return nil, ErrNotConnected
 	}
-	return nil
+
+	if sess.clientInfo.ID != clientID {
+		s.mu.Unlock()
+		return nil, ErrUnknownClient
+	}
+
+	sess.nextStreamID++
+	id := sess.nextStreamID
+	ch := make(chan net.Conn, 1)
+	sess.pending[id] = ch
+	w := sess.writer
+	s.mu.Unlock()
+
+	payload, err := protocol.StreamRequest{ID: id, Target: target}.MarshalBinary()
+	if err == nil {
+		err = enqueueErr(w.Enqueue(protocol.Frame{Kind: protocol.KindStreamRequest, Payload: payload}))
+	}
+	if err != nil {
+		s.dropPendingStream(sess, id)
+		return nil, err
+	}
+
+	select {
+	case conn := <-ch:
+		return conn, nil
+	case <-ctx.Done():
+		s.dropPendingStream(sess, id)
+		select { // the handler may have delivered just before we dropped it
+		case conn := <-ch:
+			conn.Close()
+		default:
+		}
+		return nil, ctx.Err()
+	case <-w.Done():
+		s.dropPendingStream(sess, id)
+		return nil, ErrNotConnected
+	}
+}
+
+func (s *Server) dropPendingStream(sess *session, id uint64) {
+	s.mu.Lock()
+	delete(sess.pending, id)
+	s.mu.Unlock()
+}
+
+func enqueueErr(err error) error {
+	if errors.Is(err, transport.ErrFull) {
+		return ErrSendQueueFull
+	}
+
+	if errors.Is(err, transport.ErrClosed) {
+		return ErrNotConnected
+	}
+
+	return err
 }
 
 func (s *Server) Clients() []ClientInfo {
@@ -395,6 +452,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 				ID:   clientKey.String(),
 				Name: h.Name,
 			},
+			pending: make(map[uint64]chan net.Conn),
 		}
 		s.sess = sess
 	}
