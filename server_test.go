@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -281,6 +282,19 @@ func TestServerParseAllowedClients(t *testing.T) {
 
 const testClientName = "test"
 
+type addrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.remote }
+
+var (
+	testClientAddr       = tcpAddr("[fd7a:115c:a1e0::1]:40000")
+	testClientStreamAddr = tcpAddr("[fd7a:115c:a1e0::1]:40001")
+	testOtherHostAddr    = tcpAddr("[fd7a:115c:a1e0::99]:40001")
+)
+
 // Run handleControl on one end of the pipe and perform handshake from the other side (as the client would)
 func connectClient(t *testing.T, s *Server, fake *fakeTailcat) (conn net.Conn, clientID string, done <-chan struct{}) {
 	t.Helper()
@@ -291,7 +305,7 @@ func connectClient(t *testing.T, s *Server, fake *fakeTailcat) (conn net.Conn, c
 
 	finished := make(chan struct{})
 	go func() {
-		s.handleControl(server)
+		s.handleControl(addrConn{server, testClientAddr})
 		close(finished)
 	}()
 
@@ -920,6 +934,209 @@ func TestServerRequestStreamSessionEnds(t *testing.T) {
 			if r := next(t, res); !errors.Is(r.err, ErrNotConnected) {
 				t.Fatalf("got %v, want ErrNotConnected", r.err)
 			}
+		})
+	}
+}
+
+type addrString string
+
+func (a addrString) Network() string { return "test" }
+func (a addrString) String() string  { return string(a) }
+
+func tcpAddr(s string) net.Addr {
+	return net.TCPAddrFromAddrPort(netip.MustParseAddrPort(s))
+}
+
+func TestSameHost(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b net.Addr
+		want bool
+	}{
+		{"same IP, different ports", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40001"), true},
+		{"same IP and port", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), true},
+		{"different IPs", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::2]:40000"), false},
+		{"IPv4 and its IPv6-mapped form", tcpAddr("192.0.2.1:40000"), tcpAddr("[::ffff:192.0.2.1]:40001"), true},
+		{"different IPv4s", tcpAddr("192.0.2.1:40000"), tcpAddr("192.0.2.2:40000"), false},
+		{"pipe addresses", addrString("pipe"), addrString("pipe"), false},
+		{"pipe and a real address", addrString("pipe"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
+		{"IP without a port", addrString("fd7a:115c:a1e0::1"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameHost(tc.a, tc.b); got != tc.want {
+				t.Errorf("sameHost(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			if got := sameHost(tc.b, tc.a); got != tc.want {
+				t.Errorf("sameHost(%v, %v) = %v, want %v (reversed)", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// dialStream plays the client answering a stream request
+// it connects to the server's stream port from addr and writes id.
+func dialStream(t *testing.T, s *Server, from net.Addr, id uint64) net.Conn {
+	t.Helper()
+	server, client := net.Pipe()
+	deadline := time.Now().Add(2 * time.Second)
+	server.SetDeadline(deadline)
+	client.SetDeadline(deadline)
+	t.Cleanup(func() { client.Close() })
+
+	go s.handleStream(addrConn{server, from})
+	if err := protocol.WriteStreamID(client, id); err != nil {
+		t.Fatalf("write stream ID: %v", err)
+	}
+	return client
+}
+
+func assertRefused(t *testing.T, stream net.Conn) {
+	t.Helper()
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF (stream refused)", err)
+	}
+}
+
+func pipeBytes(t *testing.T, from, to net.Conn, msg string) {
+	t.Helper()
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := from.Write([]byte(msg))
+		wrote <- err
+	}()
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(to, got); err != nil {
+		t.Fatalf("read %q: %v", msg, err)
+	}
+	if err := <-wrote; err != nil {
+		t.Fatalf("write %q: %v", msg, err)
+	}
+	if string(got) != msg {
+		t.Fatalf("got %q, want %q", got, msg)
+	}
+}
+
+func TestServerRequestStreamReturnsStream(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	conn, clientID, _ := connectClient(t, s, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res := goRequestStream(ctx, s, clientID, "5555")
+
+	req := readStreamRequest(t, conn)
+	client := dialStream(t, s, testClientStreamAddr, req.ID)
+
+	r := next(t, res)
+	if r.err != nil {
+		t.Fatalf("RequestStream: %v", r.err)
+	}
+	t.Cleanup(func() { r.conn.Close() })
+
+	pipeBytes(t, r.conn, client, "server to client")
+	pipeBytes(t, client, r.conn, "client to server")
+}
+
+func TestServerStreamRefused(t *testing.T) {
+	t.Run("unknown ID", func(t *testing.T) {
+		s, fake := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+		connectClient(t, s, fake)
+
+		assertRefused(t, dialStream(t, s, testClientStreamAddr, 99))
+	})
+
+	t.Run("no client connected", func(t *testing.T) {
+		s, _ := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+
+		assertRefused(t, dialStream(t, s, testClientStreamAddr, 1))
+	})
+
+	t.Run("dial-back after the request expired", func(t *testing.T) {
+		s, fake := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+		conn, clientID, _ := connectClient(t, s, fake)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		res := goRequestStream(ctx, s, clientID, "5555")
+		req := readStreamRequest(t, conn)
+		cancel()
+		if r := next(t, res); !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("RequestStream: %v, want context.Canceled", r.err)
+		}
+
+		assertRefused(t, dialStream(t, s, testClientStreamAddr, req.ID))
+	})
+}
+
+func TestServerStreamWrongSender(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	conn, clientID, _ := connectClient(t, s, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res := goRequestStream(ctx, s, clientID, "5555")
+	req := readStreamRequest(t, conn)
+
+	assertRefused(t, dialStream(t, s, testOtherHostAddr, req.ID))
+
+	dialStream(t, s, testClientStreamAddr, req.ID)
+	r := next(t, res)
+	if r.err != nil {
+		t.Fatalf("RequestStream after a refused sender: %v", r.err)
+	}
+	r.conn.Close()
+}
+
+func TestServerStreamClosesBeforeID(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	connectClient(t, s, fake)
+
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		s.handleStream(addrConn{server, testClientStreamAddr})
+		close(done)
+	}()
+
+	client.Write([]byte{0, 0, 0}) // part of an ID, then gone
+	client.Close()
+	assertClosed(t, done)
+}
+
+func TestServerStreamsCloseWithSession(t *testing.T) {
+	cases := []struct {
+		name string
+		end  func(s *Server, conn net.Conn)
+	}{
+		{"client drops", func(_ *Server, conn net.Conn) { conn.Close() }},
+		{"server stops", func(s *Server, _ net.Conn) { s.Stop() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, fake := startNewTestServer(t)
+			t.Cleanup(func() { s.Stop() })
+			conn, clientID, done := connectClient(t, s, fake)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			res := goRequestStream(ctx, s, clientID, "5555")
+			req := readStreamRequest(t, conn)
+			client := dialStream(t, s, testClientStreamAddr, req.ID)
+			if r := next(t, res); r.err != nil {
+				t.Fatalf("RequestStream: %v", r.err)
+			}
+
+			tc.end(s, conn)
+			assertClosed(t, done) // the session has been torn down
+
+			assertRefused(t, client) // and the stream went with it
 		})
 	}
 }

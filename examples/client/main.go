@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"time"
@@ -46,6 +48,15 @@ func main() {
 				default:
 				}
 			}
+		},
+		OnStreamRequest: func(target string, stream net.Conn) {
+			defer stream.Close()
+			if target != "echo" {
+				log.Printf("refusing stream for %q", target)
+				return
+			}
+			log.Printf("stream opened for %q, echoing", target)
+			io.Copy(stream, stream)
 		},
 	})
 
