@@ -14,15 +14,21 @@ type messageCall struct {
 	topic string
 	data  []byte
 }
+type streamCall struct {
+	target string
+	stream Stream
+}
 type recorder struct {
 	states   chan stateCall
 	messages chan messageCall
+	streams  chan streamCall
 }
 
 func newRecorder() *recorder {
 	return &recorder{
 		states:   make(chan stateCall, 8),
 		messages: make(chan messageCall, 8),
+		streams:  make(chan streamCall, 8),
 	}
 }
 
@@ -32,6 +38,10 @@ func (r *recorder) OnMessage(topic string, data []byte) {
 
 func (r *recorder) OnStateChange(state, err string) {
 	r.states <- stateCall{state, err}
+}
+
+func (r *recorder) OnStreamRequest(target string, stream Stream) {
+	r.streams <- streamCall{target, stream}
 }
 
 func nextState(t *testing.T, r *recorder) stateCall {

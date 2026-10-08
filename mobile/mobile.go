@@ -2,6 +2,7 @@ package meshnetmobile
 
 import (
 	"context"
+	"net"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
@@ -10,11 +11,19 @@ import (
 type Listener interface {
 	OnMessage(topic string, data []byte)
 	OnStateChange(state string, err string)
+	OnStreamRequest(target string, stream Stream)
 }
 type noopListener struct{}
 
-func (noopListener) OnMessage(topic string, data []byte)    {}
-func (noopListener) OnStateChange(state string, err string) {}
+func (noopListener) OnMessage(topic string, data []byte)          {}
+func (noopListener) OnStateChange(state string, err string)       {}
+func (noopListener) OnStreamRequest(target string, stream Stream) { stream.Close() }
+
+type Stream interface {
+	Read(b []byte) (n int, err error)
+	Write(b []byte) (n int, err error)
+	Close() error
+}
 
 const connectTimeout = 30 * time.Second
 
@@ -26,6 +35,7 @@ func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.Clien
 	if l == nil {
 		l = noopListener{}
 	}
+
 	return meshnet.ClientConfig{
 		ServerAddr: serverAddr,
 		PairingPIN: pairingPIN,
@@ -35,6 +45,9 @@ func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.Clien
 		},
 		OnStateChange: func(s meshnet.State, e error) {
 			l.OnStateChange(s.String(), errString(e))
+		},
+		OnStreamRequest: func(target string, stream net.Conn) {
+			l.OnStreamRequest(target, stream)
 		},
 	}
 }
