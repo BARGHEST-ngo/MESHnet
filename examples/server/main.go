@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
 )
@@ -28,6 +31,10 @@ func main() {
 				log.Fatalf("echoing message: %v", err)
 			}
 		},
+		OnClientConnected: func(c meshnet.ClientInfo) {
+			log.Printf("client connected: %s (%s)", c.ID, c.Name)
+			go streamDemo(srv, c.ID)
+		},
 	})
 
 	addr, err := srv.Start()
@@ -48,4 +55,29 @@ func main() {
 	case <-srv.Done():
 		log.Printf("server stopped: %v", srv.Err())
 	}
+}
+
+func streamDemo(srv *meshnet.Server, id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := srv.RequestStream(ctx, id, "echo")
+	if err != nil {
+		log.Printf("request stream: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	if _, err := io.WriteString(stream, "hello over a stream\n"); err != nil {
+		log.Printf("stream write: %v", err)
+		return
+	}
+
+	reply, err := bufio.NewReader(stream).ReadString('\n')
+	if err != nil {
+		log.Printf("stream read: %v", err)
+		return
+	}
+
+	log.Printf("stream echo: %q", reply)
 }
