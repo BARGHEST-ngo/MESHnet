@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 type StreamRequest struct {
@@ -54,4 +55,23 @@ func (r *StreamRequest) UnmarshalBinary(b []byte) error {
 	}
 	*r = decoded
 	return nil
+}
+
+func WriteStreamID(w io.Writer, id uint64) error {
+	_, err := w.Write(binary.BigEndian.AppendUint64(nil, id))
+	return err
+}
+
+func ReadStreamID(r io.Reader) (uint64, error) {
+	var b [uint64Size]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, fmt.Errorf("protocol: read stream id: %w", err)
+	}
+
+	id := binary.BigEndian.Uint64(b[:])
+	if id == 0 {
+		return 0, fmt.Errorf("%w: stream id 0", ErrMalformedPayload)
+	}
+
+	return id, nil
 }

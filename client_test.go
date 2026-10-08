@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -16,13 +17,27 @@ import (
 )
 
 type fakeTailcatClient struct {
-	key     key.NodePublic
-	conn    net.Conn
-	dialErr error
-	closed  atomic.Bool
+	key           key.NodePublic
+	conn          net.Conn
+	dialErr       error
+	closed        atomic.Bool
+	streams       chan net.Conn
+	streamDialErr error
+	onStreamDial  func()
 }
 
-func (f *fakeTailcatClient) DialTCPPort(context.Context, uint16) (net.Conn, error) {
+func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Conn, error) {
+	if port == protocol.StreamPort {
+		if f.onStreamDial != nil {
+			f.onStreamDial()
+		}
+		if f.streamDialErr != nil {
+			return nil, f.streamDialErr
+		}
+		server, client := net.Pipe()
+		f.streams <- server
+		return client, nil
+	}
 	if f.dialErr != nil {
 		return nil, f.dialErr
 	}
@@ -67,7 +82,11 @@ func fakeConnect(t *testing.T, setup func(cfg *ClientConfig)) (c *Client, fake *
 		states <- stateEvent{s, err}
 	}
 
-	fake = &fakeTailcatClient{key: key.NewNode().Public(), conn: clientEnd}
+	fake = &fakeTailcatClient{
+		key:     key.NewNode().Public(),
+		conn:    clientEnd,
+		streams: make(chan net.Conn, 8),
+	}
 	c = NewClient(*cfg)
 	c.newTailcat = func(ClientConfig) tailcatClient { return fake }
 	t.Cleanup(func() { c.Disconnect() })
@@ -565,4 +584,231 @@ func TestClientSendOnConnected(t *testing.T) {
 	if err := m.UnmarshalBinary(f.Payload); err != nil || m.Topic != "hello" {
 		t.Fatalf("message %+v, err %v", m, err)
 	}
+}
+
+type streamCall struct {
+	target string
+	stream net.Conn
+}
+
+func requestStream(t *testing.T, fake *fakeTailcatClient, server net.Conn, id uint64, target string) net.Conn {
+	t.Helper()
+	if err := protocol.WritePayload(
+		server,
+		protocol.KindStreamRequest,
+		protocol.StreamRequest{ID: id, Target: target},
+	); err != nil {
+		t.Fatalf("write StreamRequest: %v", err)
+	}
+
+	stream := next(t, fake.streams)
+	t.Cleanup(func() { stream.Close() })
+	stream.SetDeadline(time.Now().Add(2 * time.Second)) // a stuck stream fails, not hangs
+
+	got, err := protocol.ReadStreamID(stream)
+	if err != nil {
+		t.Fatalf("read stream ID: %v", err)
+	}
+	if got != id {
+		t.Fatalf("stream ID %d, want %d", got, id)
+	}
+	return stream
+}
+
+func TestClientStreamRequestOpensStream(t *testing.T) {
+	_, fake, server, _ := connected(t, nil)
+	requestStream(t, fake, server, 4, "5555")
+}
+
+func TestClientStreamRequestHandler(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	_, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+
+	serverEnd := requestStream(t, fake, server, 4, "5555")
+	call := next(t, calls)
+	t.Cleanup(func() { call.stream.Close() })
+	if call.target != "5555" {
+		t.Fatalf("handler target %q, want 5555", call.target)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	call.stream.SetDeadline(deadline)
+
+	for _, dir := range []struct {
+		name     string
+		from, to net.Conn
+	}{
+		{name: "client to server", from: call.stream, to: serverEnd},
+		{name: "server to client", from: serverEnd, to: call.stream},
+	} {
+		want := []byte(dir.name)
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := dir.from.Write(want)
+			wrote <- err
+		}()
+
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(dir.to, got); err != nil {
+			t.Fatalf("%s: read: %v", dir.name, err)
+		}
+		if err := <-wrote; err != nil {
+			t.Fatalf("%s: write: %v", dir.name, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("%s: got %q, want %q", dir.name, want, got)
+		}
+	}
+}
+
+func TestClientStreamRequestDefaultRefuses(t *testing.T) {
+	_, fake, server, states := connected(t, nil)
+
+	stream := requestStream(t, fake, server, 7, "5555")
+
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after the ID: %v, want EOF", err)
+	}
+	none(t, states) // refusing a stream does not end the session
+}
+
+func TestClientStreamRequestMalformed(t *testing.T) {
+	_, fake, server, states := connected(t, nil)
+
+	if err := protocol.WriteFrame(
+		server,
+		protocol.Frame{Kind: protocol.KindStreamRequest, Payload: []byte{0x01}},
+	); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+
+	events := wantStates(t, states, StateErrored)
+	if !errors.Is(events[0].err, protocol.ErrMalformedPayload) {
+		t.Fatalf("Errored with %v, want ErrMalformedPayload", events[0].err)
+	}
+	none(t, fake.streams) // nothing was dialled
+}
+
+func TestClientStreamRequestDialFails(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	c, fake, server, states := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+	fake.streamDialErr = errors.New("no route")
+
+	if err := protocol.WritePayload(
+		server,
+		protocol.KindStreamRequest, protocol.StreamRequest{ID: 7, Target: "5555"},
+	); err != nil {
+		t.Fatalf("write StreamRequest: %v", err)
+	}
+
+	none(t, calls)  // no stream so the handler is not called
+	none(t, states) // and the session carries on
+	if got := c.State(); got != StateConnected {
+		t.Fatalf("state %v, want Connected", got)
+	}
+}
+
+func TestClientStreamsCloseWithSession(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	c, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+
+	serverEnd := requestStream(t, fake, server, 7, "5555")
+	call := next(t, calls)
+
+	if err := c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	if _, err := call.stream.Read(make([]byte, 1)); err == nil {
+		t.Fatal("handler's stream still readable after Disconnect")
+	}
+	if _, err := serverEnd.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("server's end: %v, want EOF", err)
+	}
+}
+
+// Stream handlers might block for the lifetime of a stream.
+// The read loop must keep going or messages and ping/pong responses stop and end the session
+func TestClientStreamHandlerDoesNotBlockReadLoop(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	msgs := make(chan Message, 1)
+	_, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(_ string, stream net.Conn) {
+			close(entered)
+			<-release
+			stream.Close()
+		}
+		cfg.OnMessage = func(m Message) { msgs <- m }
+	})
+	t.Cleanup(func() { close(release) })
+
+	requestStream(t, fake, server, 7, "5555")
+	next(t, entered) // the handler is now blocked
+
+	if err := protocol.WritePayload(
+		server,
+		protocol.KindMsg, protocol.Msg{Topic: "status", Data: []byte("ok")},
+	); err != nil {
+		t.Fatalf("write Msg: %v", err)
+	}
+	if m := next(t, msgs); m.Topic != "status" {
+		t.Fatalf("got topic %q, want status", m.Topic)
+	}
+}
+
+func TestClientStreamRequestsAreIndependent(t *testing.T) {
+	calls := make(chan streamCall, 2)
+	_, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+
+	// Each request gets its own stream, carrying its own ID.
+	requestStream(t, fake, server, 7, "5555")
+	first := next(t, calls)
+	t.Cleanup(func() { first.stream.Close() })
+
+	requestStream(t, fake, server, 9, "capture")
+	second := next(t, calls)
+	t.Cleanup(func() { second.stream.Close() })
+
+	if first.target != "5555" || second.target != "capture" {
+		t.Fatalf("targets %q then %q, want 5555 then capture", first.target, second.target)
+	}
+
+	if first.stream == second.stream {
+		t.Fatal("both requests were given the same stream")
+	}
+}
+
+// The session can end while a stream is being dialled. The stream must then be closed
+func TestClientStreamOpenedAfterSessionEnds(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	c, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+	fake.onStreamDial = func() { c.Disconnect() }
+
+	stream := requestStream(t, fake, server, 7, "5555")
+
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after the ID: %v, want EOF", err)
+	}
+	none(t, calls)
 }
