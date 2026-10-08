@@ -2,10 +2,13 @@ package meshnetmobile
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
+	"github.com/tailscale/tailcat"
 )
 
 type Listener interface {
@@ -76,6 +79,27 @@ func (c *Client) State() string {
 
 func (c *Client) ID() string {
 	return c.c.ID()
+}
+
+// Proxy joins stream to the TCP address addr (for example "127.0.0.1:12345") and copies bytes both ways
+// Bytes are copied until both sides have finished then closes both
+// Blocks for the life of the stream
+func Proxy(stream Stream, addr string) error {
+	const proxyDialTimeout = 5 * time.Second
+	conn, ok := stream.(net.Conn)
+	if !ok {
+		stream.Close()
+		return errors.New("meshnetmobile: Proxy needs the Stream from OnStreamRequest")
+	}
+
+	local, err := net.DialTimeout("tcp", addr, proxyDialTimeout)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("meshnetmobile: dial %s: %w", addr, err)
+	}
+
+	tailcat.ProxyConns(conn, local) // closes both when done
+	return nil
 }
 
 func errString(err error) string {
