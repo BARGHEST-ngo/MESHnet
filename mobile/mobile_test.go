@@ -3,21 +3,28 @@ package meshnetmobile
 import (
 	"bytes"
 	"errors"
+	"io"
+	"net"
 	"testing"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
 )
 
-type stateCall struct{ state, err string }
+type stateCall struct {
+	state, err string
+}
+
 type messageCall struct {
 	topic string
 	data  []byte
 }
+
 type streamCall struct {
 	target string
 	stream Stream
 }
+
 type recorder struct {
 	states   chan stateCall
 	messages chan messageCall
@@ -162,5 +169,47 @@ func TestClientConfigOnStateChange(t *testing.T) {
 	}
 	if s := nextState(t, r); s != (stateCall{"Errored", "boom"}) {
 		t.Errorf("second state %+v, want {Errored, boom}", s)
+	}
+}
+
+func TestClientConfigOnStreamRequest(t *testing.T) {
+	r := newRecorder()
+	cfg := clientConfig("addr", "123456", "test", r)
+
+	ours, theirs := net.Pipe()
+	defer ours.Close()
+	theirs.SetDeadline(time.Now().Add(time.Second))
+	ours.SetDeadline(time.Now().Add(time.Second))
+
+	cfg.OnStreamRequest("Alderaan", theirs)
+	var call streamCall
+	select {
+	case call = <-r.streams:
+	default:
+		t.Fatal("Listener.OnStreamRequest not called")
+	}
+	defer call.stream.Close()
+
+	if call.target != "Alderaan" {
+		t.Errorf("target %q, want Alderaan", call.target)
+	}
+
+	go ours.Write([]byte("hello"))
+	buf := make([]byte, len("hello"))
+	if _, err := io.ReadFull(call.stream, buf); err != nil || string(buf) != "hello" {
+		t.Errorf("read %q: %v, want 'hello'", buf, err)
+	}
+}
+
+func TestClientConfigNilOnStreamRequest(t *testing.T) {
+	cfg := clientConfig("addr", "123456", "test", nil)
+
+	ours, theirs := net.Pipe()
+	defer ours.Close()
+	ours.SetDeadline(time.Now().Add(time.Second))
+
+	cfg.OnStreamRequest("Alderaan", theirs)
+	if _, err := ours.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF (stream closed)", err)
 	}
 }
