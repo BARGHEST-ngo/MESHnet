@@ -23,10 +23,14 @@ type fakeTailcatClient struct {
 	closed        atomic.Bool
 	streams       chan net.Conn
 	streamDialErr error
+	onStreamDial  func()
 }
 
 func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Conn, error) {
 	if port == protocol.StreamPort {
+		if f.onStreamDial != nil {
+			f.onStreamDial()
+		}
 		if f.streamDialErr != nil {
 			return nil, f.streamDialErr
 		}
@@ -789,4 +793,22 @@ func TestClientStreamRequestsAreIndependent(t *testing.T) {
 	if first.stream == second.stream {
 		t.Fatal("both requests were given the same stream")
 	}
+}
+
+// The session can end while a stream is being dialled. The stream must then be closed
+func TestClientStreamOpenedAfterSessionEnds(t *testing.T) {
+	calls := make(chan streamCall, 1)
+	c, fake, server, _ := connected(t, func(cfg *ClientConfig) {
+		cfg.OnStreamRequest = func(target string, stream net.Conn) {
+			calls <- streamCall{target, stream}
+		}
+	})
+	fake.onStreamDial = func() { c.Disconnect() }
+
+	stream := requestStream(t, fake, server, 7, "5555")
+
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after the ID: %v, want EOF", err)
+	}
+	none(t, calls)
 }
