@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -351,6 +352,8 @@ func (s *Server) dispatch(port uint16) func(net.Conn) {
 	switch port {
 	case protocol.ControlPort:
 		return s.handleControl
+	case protocol.StreamPort:
+		return s.handleStream
 	default:
 		return nil
 	}
@@ -540,6 +543,47 @@ func disconnectReason(cause error, stopped bool) error {
 		return cause // closed with a reason
 	}
 }
+func (s *Server) handleStream(conn net.Conn) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	id, err := protocol.ReadStreamID(conn)
+	if err != nil {
+		s.cfg.Logf("meshnet: stream: %v", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	s.mu.Lock()
+	sess := s.sess
+	if sess == nil || !sameHost(conn.RemoteAddr(), sess.conn.RemoteAddr()) {
+		s.mu.Unlock()
+		conn.Close()
+		return
+	}
+
+	ch, ok := sess.pending[id]
+	delete(sess.pending, id)
+	if ok {
+		sess.streams = append(sess.streams, conn)
+	}
+	s.mu.Unlock()
+	if !ok {
+		conn.Close()
+		return
+	}
+	ch <- conn
+}
+
+func sameHost(a, b net.Addr) bool {
+	ap, err := netip.ParseAddr(a.String())
+	if err != nil {
+		return false
+	}
+
+	bp, err := netip.ParseAddr(b.String())
+	if err != nil {
+		return false
+	}
+	return ap.String() == bp.String()
+}
 
 // tear down a session
 // close the conn and unblock a writer stuck on a dead peer
@@ -550,9 +594,14 @@ func (s *Server) endSession(sess *session, cause error) {
 	s.mu.Lock()
 	w := sess.writer
 	stopped := s.srv == nil
+	streams := sess.streams
 	s.mu.Unlock()
 	if w != nil {
 		w.Close()
+	}
+
+	for _, stream := range streams {
+		stream.Close()
 	}
 	s.clearSession(sess)
 
