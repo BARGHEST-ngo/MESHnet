@@ -3,26 +3,39 @@ package meshnetmobile
 import (
 	"bytes"
 	"errors"
+	"io"
+	"net"
 	"testing"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
 )
 
-type stateCall struct{ state, err string }
+type stateCall struct {
+	state, err string
+}
+
 type messageCall struct {
 	topic string
 	data  []byte
 }
+
+type streamCall struct {
+	target string
+	stream Stream
+}
+
 type recorder struct {
 	states   chan stateCall
 	messages chan messageCall
+	streams  chan streamCall
 }
 
 func newRecorder() *recorder {
 	return &recorder{
 		states:   make(chan stateCall, 8),
 		messages: make(chan messageCall, 8),
+		streams:  make(chan streamCall, 8),
 	}
 }
 
@@ -32,6 +45,10 @@ func (r *recorder) OnMessage(topic string, data []byte) {
 
 func (r *recorder) OnStateChange(state, err string) {
 	r.states <- stateCall{state, err}
+}
+
+func (r *recorder) OnStreamRequest(target string, stream Stream) {
+	r.streams <- streamCall{target, stream}
 }
 
 func nextState(t *testing.T, r *recorder) stateCall {
@@ -152,5 +169,115 @@ func TestClientConfigOnStateChange(t *testing.T) {
 	}
 	if s := nextState(t, r); s != (stateCall{"Errored", "boom"}) {
 		t.Errorf("second state %+v, want {Errored, boom}", s)
+	}
+}
+
+func TestClientConfigOnStreamRequest(t *testing.T) {
+	r := newRecorder()
+	cfg := clientConfig("addr", "123456", "test", r)
+
+	ours, theirs := net.Pipe()
+	defer ours.Close()
+	theirs.SetDeadline(time.Now().Add(time.Second))
+	ours.SetDeadline(time.Now().Add(time.Second))
+
+	cfg.OnStreamRequest("Alderaan", theirs)
+	var call streamCall
+	select {
+	case call = <-r.streams:
+	default:
+		t.Fatal("Listener.OnStreamRequest not called")
+	}
+	defer call.stream.Close()
+
+	if call.target != "Alderaan" {
+		t.Errorf("target %q, want Alderaan", call.target)
+	}
+
+	go ours.Write([]byte("hello"))
+	buf := make([]byte, len("hello"))
+	if _, err := io.ReadFull(call.stream, buf); err != nil || string(buf) != "hello" {
+		t.Errorf("read %q: %v, want 'hello'", buf, err)
+	}
+}
+
+func TestClientConfigNilOnStreamRequest(t *testing.T) {
+	cfg := clientConfig("addr", "123456", "test", nil)
+
+	ours, theirs := net.Pipe()
+	defer ours.Close()
+	ours.SetDeadline(time.Now().Add(time.Second))
+
+	cfg.OnStreamRequest("Alderaan", theirs)
+	if _, err := ours.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF (stream closed)", err)
+	}
+}
+
+func readN(t *testing.T, r io.Reader, n int) string {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return string(b)
+}
+
+func TestProxyCopiesBothWays(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ourEnd, theirEnd := net.Pipe()
+	defer ourEnd.Close()
+	ourEnd.SetDeadline(time.Now().Add(2 * time.Second))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Proxy(theirEnd, ln.Addr().String())
+	}()
+
+	local, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer local.Close()
+	local.SetDeadline(time.Now().Add(2 * time.Second))
+
+	go ourEnd.Write([]byte("up"))
+	if got := readN(t, local, 2); got != "up" {
+		t.Fatalf("local got %q, want up", got)
+	}
+
+	go local.Write([]byte("down"))
+	if got := readN(t, ourEnd, 4); got != "down" {
+		t.Fatalf("stream got %q, want down", got)
+	}
+
+	// Proxy returns once both directions have finished.
+	ourEnd.Close()
+	local.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Proxy: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Proxy did not return")
+	}
+}
+
+func TestProxyDialFails(t *testing.T) {
+	ourEnd, theirEnd := net.Pipe()
+	defer ourEnd.Close()
+	ourEnd.SetDeadline(time.Now().Add(2 * time.Second))
+
+	if err := Proxy(theirEnd, "127.0.0.1:0"); err == nil {
+		t.Fatal("Proxy to a closed port succeeded")
+	}
+	if _, err := ourEnd.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF (stream closed)", err)
 	}
 }
