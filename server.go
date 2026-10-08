@@ -548,6 +548,8 @@ func (s *Server) handleStream(conn net.Conn) {
 	id, err := protocol.ReadStreamID(conn)
 	if err != nil {
 		s.cfg.Logf("meshnet: stream: %v", err)
+		conn.Close()
+		return
 	}
 	conn.SetReadDeadline(time.Time{})
 
