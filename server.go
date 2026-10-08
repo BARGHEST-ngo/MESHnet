@@ -573,16 +573,16 @@ func (s *Server) handleStream(conn net.Conn) {
 }
 
 func sameHost(a, b net.Addr) bool {
-	ap, err := netip.ParseAddr(a.String())
+	ap, err := netip.ParseAddrPort(a.String())
 	if err != nil {
 		return false
 	}
 
-	bp, err := netip.ParseAddr(b.String())
+	bp, err := netip.ParseAddrPort(b.String())
 	if err != nil {
 		return false
 	}
-	return ap.String() == bp.String()
+	return ap.Addr().String() == bp.Addr().String()
 }
 
 // tear down a session

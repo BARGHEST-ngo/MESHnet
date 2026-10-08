@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -919,6 +920,43 @@ func TestServerRequestStreamSessionEnds(t *testing.T) {
 
 			if r := next(t, res); !errors.Is(r.err, ErrNotConnected) {
 				t.Fatalf("got %v, want ErrNotConnected", r.err)
+			}
+		})
+	}
+}
+
+type addrString string
+
+func (a addrString) Network() string { return "test" }
+func (a addrString) String() string  { return string(a) }
+
+func tcpAddr(s string) net.Addr {
+	return net.TCPAddrFromAddrPort(netip.MustParseAddrPort(s))
+}
+
+func TestSameHost(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b net.Addr
+		want bool
+	}{
+		{"same IP, different ports", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40001"), true},
+		{"same IP and port", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), true},
+		{"different IPs", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::2]:40000"), false},
+		{"IPv4 and its IPv6-mapped form", tcpAddr("192.0.2.1:40000"), tcpAddr("[::ffff:192.0.2.1]:40001"), true},
+		{"different IPv4s", tcpAddr("192.0.2.1:40000"), tcpAddr("192.0.2.2:40000"), false},
+		{"pipe addresses", addrString("pipe"), addrString("pipe"), false},
+		{"pipe and a real address", addrString("pipe"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
+		{"IP without a port", addrString("fd7a:115c:a1e0::1"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameHost(tc.a, tc.b); got != tc.want {
+				t.Errorf("sameHost(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			if got := sameHost(tc.b, tc.a); got != tc.want {
+				t.Errorf("sameHost(%v, %v) = %v, want %v (reversed)", tc.b, tc.a, got, tc.want)
 			}
 		})
 	}
