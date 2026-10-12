@@ -20,6 +20,8 @@ import (
 )
 
 type fakeTailcat struct {
+	mu         sync.Mutex
+	peers      map[netip.Addr]key.NodePublic
 	closeCalls atomic.Int32
 	connected  chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
 }
@@ -39,11 +41,33 @@ func (f *fakeTailcat) Close() error {
 	return nil
 }
 
-func (f *fakeTailcat) AddAllowedClient(k key.NodePublic) {}
+func (f *fakeTailcat) addPeer(addr net.Addr, k key.NodePublic) {
+	ap := netip.MustParseAddrPort(addr.String())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.peers == nil {
+		f.peers = make(map[netip.Addr]key.NodePublic)
+	}
+	f.peers[ap.Addr()] = k
+}
+
+func (f *fakeTailcat) PeerKey(remote net.Addr) (key.NodePublic, bool) {
+	ap, err := netip.ParseAddrPort(remote.String())
+	if err != nil {
+		return key.NodePublic{}, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.peers[ap.Addr()]
+	return k, ok
+}
 
 func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeTailcat) {
 	t.Helper()
-	fake := &fakeTailcat{connected: make(chan string, 4)}
+	fake := &fakeTailcat{
+		connected: make(chan string, 4),
+		peers:     make(map[netip.Addr]key.NodePublic),
+	}
 	cfg := &ServerConfig{}
 	if setup != nil {
 		setup(cfg)
@@ -313,8 +337,9 @@ func connectClient(t *testing.T, s *Server, fake *fakeTailcat) (conn net.Conn, c
 		client.Close()
 		<-finished
 	})
-
-	clientID = key.NewNode().Public().String()
+	clientPub := key.NewNode().Public()
+	fake.addPeer(testClientAddr, clientPub)
+	clientID = clientPub.String()
 	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: testClientName, PIN: s.PairingPIN()}
 	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
 		t.Fatalf("write hello: %v", err)
