@@ -1165,3 +1165,82 @@ func TestServerStreamsCloseWithSession(t *testing.T) {
 		})
 	}
 }
+
+// tryPair connects from the fake client's address with the right PIN, claiming key k.
+func tryPair(t *testing.T, s *Server, k key.NodePublic) protocol.CloseErr {
+	t.Helper()
+	server, client := net.Pipe()
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+
+	finished := make(chan struct{})
+	go func() {
+		s.handleControl(addrConn{server, testClientAddr})
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-finished
+	})
+
+	hello := protocol.Hello{
+		Version: protocol.Version,
+		Key:     k.String(),
+		Name:    testClientName,
+		PIN:     s.PairingPIN(),
+	}
+	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	f, err := protocol.ReadFrame(client)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if f.Kind == protocol.KindHelloAck {
+		return protocol.CloseErrNone
+	}
+	var c protocol.Close
+	if err := c.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("reply was %v, not a HelloAck or Close: %v", f.Kind, err)
+	}
+	return c.Err
+}
+
+func TestServerHelloKeyMustBeThePeer(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	tunnelKey := key.NewNode().Public()
+
+	if err := tryPair(t, s, tunnelKey); err != protocol.CloseErrInvalidKey {
+		t.Fatalf("peer unknown to tailcat: %v, want invalid_key", err)
+	}
+
+	fake.addPeer(testClientAddr, tunnelKey)
+
+	if err := tryPair(t, s, key.NewNode().Public()); err != protocol.CloseErrInvalidKey {
+		t.Fatalf("claiming another key: %v, want invalid_key", err)
+	}
+
+	if err := tryPair(t, s, tunnelKey); err != protocol.CloseErrNone {
+		t.Fatalf("the tunnel's own key: %v, want to pair", err)
+	}
+}
+
+func TestServerAllowClient(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	stranger := key.NewNode().Public()
+
+	if !s.allowClient(stranger) {
+		t.Fatal("before pairing: a new client was refused")
+	}
+
+	_, clientID, _ := connectClient(t, s, fake)
+	paired, _ := parseKey(clientID)
+
+	if s.allowClient(stranger) {
+		t.Fatal("after pairing: a stranger was allowed")
+	}
+	if !s.allowClient(*paired) {
+		t.Fatal("after pairing: the paired client was refused")
+	}
+}
