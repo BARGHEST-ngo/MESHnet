@@ -9,7 +9,6 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +27,6 @@ type tailcatServer interface {
 }
 
 type ServerConfig struct {
-	AllowedClients       []string
 	Logf                 func(format string, args ...any)
 	OnMessage            func(clientID string, m Message)
 	OnClientConnected    func(c ClientInfo)
@@ -64,7 +62,7 @@ type Server struct {
 	sess    *session
 
 	cfg        ServerConfig
-	newTailcat func([]key.NodePublic) tailcatServer
+	newTailcat func() tailcatServer
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -73,7 +71,6 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(format string, args ...any) {}
 	}
-	cfg.AllowedClients = slices.Clone(cfg.AllowedClients)
 
 	if cfg.OnMessage == nil {
 		cfg.OnMessage = func(clientID string, m Message) {}
@@ -131,11 +128,10 @@ func (p *pairing) redeem(pin string) protocol.CloseErr {
 	return protocol.CloseErrNone
 }
 
-func (s *Server) buildTailcat(allow []key.NodePublic) tailcatServer {
+func (s *Server) buildTailcat() tailcatServer {
 	srv := &tailcat.Server{
-		OnTCP:          s.dispatch,
-		Logf:           s.cfg.Logf,
-		AllowedClients: allow,
+		OnTCP: s.dispatch,
+		Logf:  s.cfg.Logf,
 	}
 	return srv
 }
@@ -147,17 +143,12 @@ func (s *Server) Start() (addr string, err error) {
 		return "", ErrAlreadyStarted
 	}
 
-	allowList, err := parseAllowedClients(s.cfg.AllowedClients)
-	if err != nil {
-		return "", fmt.Errorf("server: start: %w", err)
-	}
-
 	p, err := newPairing()
 	if err != nil {
 		return "", fmt.Errorf("server: start: %w", err)
 	}
 
-	srv := s.newTailcat(allowList)
+	srv := s.newTailcat()
 	if err := srv.Start(); err != nil {
 		return "", fmt.Errorf("server: start: %w", err)
 	}
