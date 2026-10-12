@@ -58,7 +58,7 @@ func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeT
 	}
 
 	s := NewServer(*cfg)
-	s.newTailcat = func([]key.NodePublic) tailcatServer { return fake }
+	s.newTailcat = func() tailcatServer { return fake }
 	return s, fake
 }
 
