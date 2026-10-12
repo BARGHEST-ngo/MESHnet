@@ -394,9 +394,6 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 	}
 }
 
-// TODO - If the server starts with a pre-approved list of client keys, the PIN is not required
-// but this handshake handler currently demands one
-// Not needed in our existing use-case for MESHnet so will come back to that one...
 func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
@@ -424,9 +421,6 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		return nil, false
 	}
 
-	// Likely going to refactor this switch block
-	// Confirms a Hello message is valid
-	// key-to-tunnel-IP check will go here..
 	clientKey, keyParseErr := parseKey(h.Key)
 	s.mu.Lock()
 	srv := s.srv
