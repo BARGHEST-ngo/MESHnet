@@ -20,6 +20,8 @@ import (
 )
 
 type fakeTailcat struct {
+	mu         sync.Mutex
+	peers      map[netip.Addr]key.NodePublic
 	closeCalls atomic.Int32
 	connected  chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
 }
@@ -39,11 +41,33 @@ func (f *fakeTailcat) Close() error {
 	return nil
 }
 
-func (f *fakeTailcat) AddAllowedClient(k key.NodePublic) {}
+func (f *fakeTailcat) addPeer(addr net.Addr, k key.NodePublic) {
+	ap := netip.MustParseAddrPort(addr.String())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.peers == nil {
+		f.peers = make(map[netip.Addr]key.NodePublic)
+	}
+	f.peers[ap.Addr()] = k
+}
+
+func (f *fakeTailcat) PeerKey(remote net.Addr) (key.NodePublic, bool) {
+	ap, err := netip.ParseAddrPort(remote.String())
+	if err != nil {
+		return key.NodePublic{}, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.peers[ap.Addr()]
+	return k, ok
+}
 
 func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeTailcat) {
 	t.Helper()
-	fake := &fakeTailcat{connected: make(chan string, 4)}
+	fake := &fakeTailcat{
+		connected: make(chan string, 4),
+		peers:     make(map[netip.Addr]key.NodePublic),
+	}
 	cfg := &ServerConfig{}
 	if setup != nil {
 		setup(cfg)
@@ -313,8 +337,9 @@ func connectClient(t *testing.T, s *Server, fake *fakeTailcat) (conn net.Conn, c
 		client.Close()
 		<-finished
 	})
-
-	clientID = key.NewNode().Public().String()
+	clientPub := key.NewNode().Public()
+	fake.addPeer(testClientAddr, clientPub)
+	clientID = clientPub.String()
 	hello := protocol.Hello{Version: protocol.Version, Key: clientID, Name: testClientName, PIN: s.PairingPIN()}
 	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
 		t.Fatalf("write hello: %v", err)
@@ -1138,5 +1163,84 @@ func TestServerStreamsCloseWithSession(t *testing.T) {
 
 			assertRefused(t, client) // and the stream went with it
 		})
+	}
+}
+
+// tryPair connects from the fake client's address with the right PIN, claiming key k.
+func tryPair(t *testing.T, s *Server, k key.NodePublic) protocol.CloseErr {
+	t.Helper()
+	server, client := net.Pipe()
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+
+	finished := make(chan struct{})
+	go func() {
+		s.handleControl(addrConn{server, testClientAddr})
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-finished
+	})
+
+	hello := protocol.Hello{
+		Version: protocol.Version,
+		Key:     k.String(),
+		Name:    testClientName,
+		PIN:     s.PairingPIN(),
+	}
+	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	f, err := protocol.ReadFrame(client)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if f.Kind == protocol.KindHelloAck {
+		return protocol.CloseErrNone
+	}
+	var c protocol.Close
+	if err := c.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("reply was %v, not a HelloAck or Close: %v", f.Kind, err)
+	}
+	return c.Err
+}
+
+func TestServerHelloKeyMustBeThePeer(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	tunnelKey := key.NewNode().Public()
+
+	if err := tryPair(t, s, tunnelKey); err != protocol.CloseErrInvalidKey {
+		t.Fatalf("peer unknown to tailcat: %v, want invalid_key", err)
+	}
+
+	fake.addPeer(testClientAddr, tunnelKey)
+
+	if err := tryPair(t, s, key.NewNode().Public()); err != protocol.CloseErrInvalidKey {
+		t.Fatalf("claiming another key: %v, want invalid_key", err)
+	}
+
+	if err := tryPair(t, s, tunnelKey); err != protocol.CloseErrNone {
+		t.Fatalf("the tunnel's own key: %v, want to pair", err)
+	}
+}
+
+func TestServerAllowClient(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	stranger := key.NewNode().Public()
+
+	if !s.allowClient(stranger) {
+		t.Fatal("before pairing: a new client was refused")
+	}
+
+	_, clientID, _ := connectClient(t, s, fake)
+	paired, _ := parseKey(clientID)
+
+	if s.allowClient(stranger) {
+		t.Fatal("after pairing: a stranger was allowed")
+	}
+	if !s.allowClient(*paired) {
+		t.Fatal("after pairing: the paired client was refused")
 	}
 }

@@ -23,7 +23,7 @@ type tailcatServer interface {
 	Start() error
 	Close() error
 	TailcatAddr() tailcat.Addr
-	AddAllowedClient(k key.NodePublic)
+	PeerKey(remote net.Addr) (key.NodePublic, bool)
 }
 
 type ServerConfig struct {
@@ -51,6 +51,7 @@ type pairing struct {
 	pin  string
 	used bool // the PIN has been redeemed, no more pairings this run
 	// later - attempt limits, expiry time
+	key key.NodePublic
 }
 
 type Server struct {
@@ -130,8 +131,9 @@ func (p *pairing) redeem(pin string) protocol.CloseErr {
 
 func (s *Server) buildTailcat() tailcatServer {
 	srv := &tailcat.Server{
-		OnTCP: s.dispatch,
-		Logf:  s.cfg.Logf,
+		OnTCP:       s.dispatch,
+		Logf:        s.cfg.Logf,
+		AllowClient: s.allowClient,
 	}
 	return srv
 }
@@ -392,9 +394,6 @@ func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
 	}
 }
 
-// TODO - If the server starts with a pre-approved list of client keys, the PIN is not required
-// but this handshake handler currently demands one
-// Not needed in our existing use-case for MESHnet so will come back to that one...
 func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
@@ -422,24 +421,31 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		return nil, false
 	}
 
-	// Likely going to refactor this switch block
-	// Confirms a Hello message is valid
-	// key-to-tunnel-IP check will go here..
 	clientKey, keyParseErr := parseKey(h.Key)
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+
+	keyIsPeer := false
+	if srv != nil && keyParseErr == nil {
+		peer, ok := srv.PeerKey(conn.RemoteAddr())
+		keyIsPeer = ok && peer == *clientKey
+	}
+
 	s.mu.Lock()
 	var reason protocol.CloseErr
 	var sess *session
-	srv := s.srv
 	switch {
 	case h.Version != protocol.Version:
 		reason = protocol.CloseErrVersionMismatch
-	case keyParseErr != nil:
+	case keyParseErr != nil || !keyIsPeer:
 		reason = protocol.CloseErrInvalidKey
 	default:
 		reason = s.pairing.redeem(h.PIN)
 	}
 
 	if reason == protocol.CloseErrNone {
+		s.pairing.key = *clientKey
 		sess = &session{
 			conn: conn,
 			clientInfo: ClientInfo{
@@ -462,8 +468,6 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		return nil, false
 	}
 
-	srv.AddAllowedClient(*clientKey)
-
 	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
 		Version:  protocol.Version,
 		ClientID: sess.clientInfo.ID,
@@ -481,6 +485,12 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	conn.SetDeadline(time.Time{})
 
 	return sess, true
+}
+
+func (s *Server) allowClient(k key.NodePublic) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.pairing.used || s.pairing.key == k
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
