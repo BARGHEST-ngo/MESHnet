@@ -988,7 +988,7 @@ func dialStream(t *testing.T, s *Server, from net.Addr, id uint64) net.Conn {
 	t.Cleanup(func() { client.Close() })
 
 	go s.handleStream(addrConn{server, from})
-	if err := protocol.WriteStreamID(client, id); err != nil {
+	if err := protocol.WriteStreamID(client, id); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("write stream ID: %v", err)
 	}
 	return client
@@ -1220,4 +1220,12 @@ func TestServerAllowClient(t *testing.T) {
 	if !s.allowClient(*paired) {
 		t.Fatal("after pairing: the paired client was refused")
 	}
+}
+
+func TestServerStreamFromUnpairedPeer(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	connectClient(t, s, fake)
+	fake.addPeer(testOtherHostAddr, key.NewNode().Public())
+	assertRefused(t, dialStream(t, s, testOtherHostAddr, 1))
 }
