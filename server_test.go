@@ -1136,8 +1136,13 @@ func TestServerStreamsCloseWithSession(t *testing.T) {
 	}
 }
 
-// tryPair connects from the fake client's address with the right PIN, claiming key k.
 func tryPair(t *testing.T, s *Server, k key.NodePublic) protocol.CloseErr {
+	t.Helper()
+	return tryPairPIN(t, s, k, s.PairingPIN())
+}
+
+// tryPairPIN connects from the fake client's address with the right PIN, claiming key k.
+func tryPairPIN(t *testing.T, s *Server, k key.NodePublic, pin string) protocol.CloseErr {
 	t.Helper()
 	server, client := net.Pipe()
 	client.SetDeadline(time.Now().Add(2 * time.Second))
@@ -1156,7 +1161,7 @@ func tryPair(t *testing.T, s *Server, k key.NodePublic) protocol.CloseErr {
 		Version: protocol.Version,
 		Key:     k.String(),
 		Name:    testClientName,
-		PIN:     s.PairingPIN(),
+		PIN:     pin,
 	}
 	if err := protocol.WritePayload(client, protocol.KindHello, hello); err != nil {
 		t.Fatalf("write hello: %v", err)
@@ -1196,22 +1201,37 @@ func TestServerHelloKeyMustBeThePeer(t *testing.T) {
 }
 
 func TestServerAllowClient(t *testing.T) {
-	s, fake := startNewTestServer(t)
+	s, fake := newTestServer(t, nil)
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	t.Cleanup(func() { s.Stop() })
 	stranger := key.NewNode().Public()
 
-	if !s.allowClient(stranger) {
-		t.Fatal("before pairing: a new client was refused")
+	if s.allowClient(stranger) {
+		t.Fatal("no pairing pending: a stranger was allowed")
 	}
 
-	_, clientID, _ := connectClient(t, s, fake)
-	paired, _ := parseKey(clientID)
+	if _, err := s.NewPairing(); err != nil {
+		t.Fatalf("NewPairing: %v", err)
+	}
+	if !s.allowClient(stranger) {
+		t.Fatal("pairing pending: a new client was refused")
+	}
 
+	conn, clientID, done := connectClient(t, s, fake)
+	paired, _ := parseKey(clientID)
 	if s.allowClient(stranger) {
 		t.Fatal("after pairing: a stranger was allowed")
 	}
 	if !s.allowClient(*paired) {
 		t.Fatal("after pairing: the paired client was refused")
+	}
+
+	conn.Close()
+	assertClosed(t, done)
+	if s.allowClient(*paired) {
+		t.Fatal("after its session ended: the client was still allowed")
 	}
 }
 
@@ -1221,4 +1241,196 @@ func TestServerStreamFromUnpairedPeer(t *testing.T) {
 	connectClient(t, s, fake)
 	fake.addPeer(testOtherHostAddr, key.NewNode().Public())
 	assertRefused(t, dialStream(t, s, testOtherHostAddr, 1))
+}
+
+func TestServerNewPairing(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+
+	if _, err := s.NewPairing(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("before Start: %v, want ErrClosed", err)
+	}
+
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := s.PairingPIN(); got != "" {
+		t.Fatalf("PairingPIN before any pairing = %q, want empty", got)
+	}
+
+	pin, err := s.NewPairing()
+	if err != nil {
+		t.Fatalf("NewPairing: %v", err)
+	}
+	if len(pin) != 6 || strings.Trim(pin, "0123456789") != "" {
+		t.Fatalf("PIN %q, want 6 digits", pin)
+	}
+	if got := s.PairingPIN(); got != pin {
+		t.Fatalf("PairingPIN = %q, want %q", got, pin)
+	}
+
+	s.Stop()
+	if got := s.PairingPIN(); got != "" {
+		t.Fatalf("PairingPIN after Stop = %q, want empty", got)
+	}
+	if _, err := s.NewPairing(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("after Stop: %v, want ErrClosed", err)
+	}
+}
+
+// newPeer registers a new tunnel peer at the fake client's address and returns its key.
+func newPeer(fake *fakeTailcat) key.NodePublic {
+	k := key.NewNode().Public()
+	fake.addPeer(testClientAddr, k)
+	return k
+}
+
+// With no pairing pending the server pairs with nobody, whatever PIN is sent.
+func TestServerNoPairingPending(t *testing.T) {
+	s, fake := newTestServer(t, nil)
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { s.Stop() })
+
+	if got := tryPairPIN(t, s, newPeer(fake), "123456"); got != protocol.CloseErrPairingLocked {
+		t.Fatalf("got %v, want pairing_locked", got)
+	}
+}
+
+func TestServerPINSingleUse(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	pin := s.PairingPIN()
+
+	if got := tryPairPIN(t, s, newPeer(fake), pin); got != protocol.CloseErrNone {
+		t.Fatalf("first use: %v, want to pair", got)
+	}
+	if got := s.PairingPIN(); got != "" {
+		t.Fatalf("PairingPIN after pairing = %q, want empty", got)
+	}
+	if got := tryPairPIN(t, s, newPeer(fake), pin); got != protocol.CloseErrPairingLocked {
+		t.Fatalf("second use: %v, want pairing_locked", got)
+	}
+}
+
+func TestServerWrongPINs(t *testing.T) {
+	t.Run("fewer than the limit leave the PIN usable", func(t *testing.T) {
+		s, fake := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+		pin := s.PairingPIN()
+
+		for i := range maxPairingFailures - 1 {
+			if got := tryPairPIN(t, s, newPeer(fake), "000000"); got != protocol.CloseErrWrongPIN {
+				t.Fatalf("wrong PIN %d: %v, want wrong_pin", i, got)
+			}
+		}
+		if got := tryPairPIN(t, s, newPeer(fake), pin); got != protocol.CloseErrNone {
+			t.Fatalf("right PIN: %v, want to pair", got)
+		}
+	})
+
+	t.Run("the limit burns the pairing", func(t *testing.T) {
+		s, fake := startNewTestServer(t)
+		t.Cleanup(func() { s.Stop() })
+		pin := s.PairingPIN()
+
+		for i := range maxPairingFailures {
+			if got := tryPairPIN(t, s, newPeer(fake), "000000"); got != protocol.CloseErrWrongPIN {
+				t.Fatalf("wrong PIN %d: %v, want wrong_pin", i, got)
+			}
+		}
+		if got := tryPairPIN(t, s, newPeer(fake), pin); got != protocol.CloseErrPairingLocked {
+			t.Fatalf("right PIN after the limit: %v, want pairing_locked", got)
+		}
+		if got := s.PairingPIN(); got != "" {
+			t.Fatalf("PairingPIN after the limit = %q, want empty", got)
+		}
+
+		// A new pairing starts again with a full set of attempts.
+		fresh, err := s.NewPairing()
+		if err != nil {
+			t.Fatalf("NewPairing: %v", err)
+		}
+		if got := tryPairPIN(t, s, newPeer(fake), fresh); got != protocol.CloseErrNone {
+			t.Fatalf("new pairing: %v, want to pair", got)
+		}
+	})
+}
+
+func TestServerPairingExpires(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	pin := s.PairingPIN()
+
+	s.mu.Lock()
+	s.now = func() time.Time { return time.Now().Add(pairingTTL + time.Second) }
+	s.mu.Unlock()
+
+	if got := s.PairingPIN(); got != "" {
+		t.Fatalf("PairingPIN after expiry = %q, want empty", got)
+	}
+	if got := tryPairPIN(t, s, newPeer(fake), pin); got != protocol.CloseErrPairingLocked {
+		t.Fatalf("expired PIN: %v, want pairing_locked", got)
+	}
+}
+
+func TestServerReplaceAndCancelPairing(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+
+	first := s.PairingPIN()
+	second, err := s.NewPairing()
+	for err == nil && second == first { // a one-in-a-million repeat
+		second, err = s.NewPairing()
+	}
+	if err != nil {
+		t.Fatalf("NewPairing: %v", err)
+	}
+
+	if got := tryPairPIN(t, s, newPeer(fake), first); got != protocol.CloseErrWrongPIN {
+		t.Fatalf("replaced PIN: %v, want wrong_pin", got)
+	}
+
+	s.CancelPairing()
+	if got := s.PairingPIN(); got != "" {
+		t.Fatalf("PairingPIN after cancel = %q, want empty", got)
+	}
+	if got := tryPairPIN(t, s, newPeer(fake), second); got != protocol.CloseErrPairingLocked {
+		t.Fatalf("cancelled PIN: %v, want pairing_locked", got)
+	}
+}
+
+func TestServerNewPairingWhenFull(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	connectClient(t, s, fake)
+
+	if _, err := s.NewPairing(); !errors.Is(err, ErrServerFull) {
+		t.Fatalf("NewPairing with a client connected: %v, want ErrServerFull", err)
+	}
+}
+
+// The point of pairings on demand: after a client leaves, a new one can pair
+// on the same server run, with a new PIN and no restart.
+func TestServerPairAgainWithoutRestart(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+
+	conn, firstID, done := connectClient(t, s, fake)
+	conn.Close()
+	assertClosed(t, done) // the first session has ended
+
+	if _, err := s.NewPairing(); err != nil {
+		t.Fatalf("NewPairing after the client left: %v", err)
+	}
+	_, secondID, _ := connectClient(t, s, fake)
+	if secondID == firstID {
+		t.Fatal("the second client has the first client's ID")
+	}
+	if err := s.Send(secondID, Message{Topic: "status", Data: []byte("ok")}); err != nil {
+		t.Fatalf("Send to the second client: %v", err)
+	}
+	if err := s.Send(firstID, Message{Topic: "status"}); !errors.Is(err, ErrUnknownClient) {
+		t.Fatalf("Send to the first client: %v, want ErrUnknownClient", err)
+	}
 }
