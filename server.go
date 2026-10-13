@@ -70,6 +70,7 @@ type Server struct {
 
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
+	now        func() time.Time
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -105,6 +106,7 @@ func NewServer(cfg ServerConfig) *Server {
 		done: done,
 		err:  ErrClosed,
 		cfg:  cfg,
+		now:  time.Now,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
@@ -155,7 +157,7 @@ func (s *Server) NewPairing() (string, error) {
 		return "", ErrServerFull
 	}
 
-	s.pairing = &pairing{pin: pin, expires: time.Now().Add(pairingTTL)}
+	s.pairing = &pairing{pin: pin, expires: s.now().Add(pairingTTL)}
 	return pin, nil
 }
 
@@ -169,7 +171,7 @@ func newPIN() (string, error) {
 
 // nil if none or expired
 func (s *Server) pendingPairing() *pairing {
-	if s.pairing != nil && !time.Now().Before(s.pairing.expires) {
+	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
 		s.pairing = nil
 	}
 	return s.pairing
@@ -213,6 +215,7 @@ func (s *Server) Stop() error {
 	done := s.done
 	s.srv = nil
 	s.sessions = nil
+	s.pairing = nil
 	s.err = ErrClosed
 	s.mu.Unlock()
 
