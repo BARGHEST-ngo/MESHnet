@@ -169,16 +169,17 @@ func newPIN() (string, error) {
 	return fmt.Sprintf("%06d", pin), nil
 }
 
-// nil if none or expired
-func (s *Server) pendingPairing() *pairing {
+// nil if none or expired, s.mu must be locked
+func (s *Server) pendingPairingLocked() *pairing {
 	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
 		s.pairing = nil
 	}
 	return s.pairing
 }
 
-func (s *Server) redeem(pin string) protocol.CloseErr {
-	p := s.pendingPairing()
+// Attempt to redeemLocked pin, s.mu must be locked
+func (s *Server) redeemLocked(pin string) protocol.CloseErr {
+	p := s.pendingPairingLocked()
 	if p == nil {
 		return protocol.CloseErrPairingLocked
 	}
@@ -342,7 +343,7 @@ func (s *Server) Err() error {
 func (s *Server) PairingPIN() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p := s.pendingPairing(); p != nil {
+	if p := s.pendingPairingLocked(); p != nil {
 		return p.pin
 	}
 	return ""
@@ -476,7 +477,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	case keyParseErr != nil || !keyIsPeer:
 		reason = protocol.CloseErrInvalidKey
 	default:
-		reason = s.redeem(h.PIN)
+		reason = s.redeemLocked(h.PIN)
 	}
 
 	if reason == protocol.CloseErrNone {
@@ -524,7 +525,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 func (s *Server) allowClient(k key.NodePublic) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pendingPairing() != nil || s.sessions[k.String()] != nil
+	return s.pendingPairingLocked() != nil || s.sessions[k.String()] != nil
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
@@ -625,7 +626,7 @@ func (s *Server) handleStream(conn net.Conn) {
 	ch <- conn
 }
 
-// returns the cojnnected session for client id, s.mu must be held
+// returns the connected session for client id, s.mu must be held
 func (s *Server) sessionForClientLocked(id string) (*session, error) {
 	if len(s.sessions) == 0 {
 		return nil, ErrNotConnected
