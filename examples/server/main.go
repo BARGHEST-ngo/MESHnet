@@ -43,7 +43,12 @@ func main() {
 	}
 
 	log.Printf("server address: %s", addr)
-	log.Printf("server pairing PIN: %s", srv.PairingPIN())
+
+	pin, err := srv.NewPairing()
+	if err != nil {
+		log.Fatalf("new pairing: %v", err)
+	}
+	log.Printf("server pairing PIN: %s", pin)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
