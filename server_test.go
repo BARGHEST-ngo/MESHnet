@@ -364,7 +364,19 @@ func startNewTestServer(t *testing.T) (*Server, *fakeTailcat) {
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	s.NewPairing()
 	return s, f
+}
+
+// startPairing starts s and opens a pairing, so a client can connect.
+func startPairing(t *testing.T, s *Server) {
+	t.Helper()
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := s.NewPairing(); err != nil {
+		t.Fatalf("new pairing: %v", err)
+	}
 }
 
 func TestServerReceiveMessage(t *testing.T) {
@@ -379,9 +391,7 @@ func TestServerReceiveMessage(t *testing.T) {
 		}
 	})
 
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("start: %v", err)
-	}
+	startPairing(t, s)
 
 	conn, clientID, _ := connectClient(t, s, fake)
 	sent := protocol.Msg{Topic: "status", Data: []byte("ok")}
@@ -488,9 +498,7 @@ func TestServerOnMessageCanSend(t *testing.T) {
 		}
 	})
 
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	startPairing(t, s)
 	conn, _, _ := connectClient(t, s, fake)
 
 	if err := protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "ping", Data: []byte("hi")}); err != nil {
@@ -541,9 +549,7 @@ func TestServerMalformedFrameEndsSession(t *testing.T) {
 				cfg.OnMessage = func(string, Message) { called.Store(true) }
 			})
 
-			if _, err := s.Start(); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
+			startPairing(t, s)
 			conn, _, done := connectClient(t, s, fake)
 
 			if err := protocol.WriteFrame(conn, tc.frame); err != nil {
@@ -670,9 +676,7 @@ func TestServerDisconnectReason(t *testing.T) {
 func TestServerOnClientConnected(t *testing.T) {
 	var l *lifecycle
 	s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	startPairing(t, s)
 	_, clientID, _ := connectClient(t, s, fake)
 
 	got := next(t, l.connected)
@@ -691,9 +695,7 @@ func TestServerOnClientConnectedCanSend(t *testing.T) {
 			}
 		}
 	})
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	startPairing(t, s)
 	conn, _, _ := connectClient(t, s, fake)
 
 	f, err := protocol.ReadFrame(conn) // the first frame after HelloAck
@@ -759,9 +761,7 @@ func TestServerOnClientDisconnected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var l *lifecycle
 			s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
-			if _, err := s.Start(); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
+			startPairing(t, s)
 			conn, clientID, done := connectClient(t, s, fake)
 			next(t, l.connected)
 
@@ -785,9 +785,7 @@ func TestServerLifecycleOrder(t *testing.T) {
 		cfg.OnMessage = func(string, Message) { events <- "message" }
 		cfg.OnClientDisconnected = func(ClientInfo, error) { events <- "disconnected" }
 	})
-	if _, err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	startPairing(t, s)
 	conn, _, done := connectClient(t, s, fake)
 
 	protocol.WritePayload(conn, protocol.KindMsg, protocol.Msg{Topic: "t"})
@@ -967,11 +965,6 @@ func TestServerRequestStreamSessionEnds(t *testing.T) {
 		})
 	}
 }
-
-type addrString string
-
-func (a addrString) Network() string { return "test" }
-func (a addrString) String() string  { return string(a) }
 
 func tcpAddr(s string) net.Addr {
 	return net.TCPAddrFromAddrPort(netip.MustParseAddrPort(s))

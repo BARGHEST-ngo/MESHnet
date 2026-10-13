@@ -19,6 +19,7 @@ var (
 	ErrUnknownClient  = errors.New("meshnet: unknown clientID")
 	ErrSendQueueFull  = errors.New("meshnet: too many messages enqueued")
 	ErrServerClosed   = errors.New("meshnet: server closed the connection")
+	ErrServerFull     = errors.New("meshnet: maximum clients connected")
 )
 
 func (s State) String() string {
