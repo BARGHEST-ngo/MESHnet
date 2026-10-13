@@ -101,6 +101,7 @@ func liveServer(t *testing.T, timeout time.Duration) (*Server, *fakeTailcat, *li
 	if _, err := s.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	s.NewPairing()
 	t.Cleanup(func() { s.Stop() })
 	return s, fake, l
 }

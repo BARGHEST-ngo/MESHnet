@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -48,22 +47,30 @@ type session struct {
 }
 
 type pairing struct {
-	pin  string
-	used bool // the PIN has been redeemed, no more pairings this run
-	// later - attempt limits, expiry time
-	key key.NodePublic
+	pin      string
+	expires  time.Time
+	failures int
 }
 
+const (
+	pairingTTL         = 10 * time.Minute
+	maxPairingFailures = 3
+	// Starting at 1, may be configurable
+	// Note - pairing below and relevant functions assume only one pairing at once
+	maxClients = 1
+)
+
 type Server struct {
-	mu      sync.Mutex // guards all before line break
-	srv     tailcatServer
-	done    chan struct{}
-	err     error
-	pairing pairing // to be a map of potential pairings for multiple clients
-	sess    *session
+	mu       sync.Mutex // guards all before line break
+	srv      tailcatServer
+	done     chan struct{}
+	err      error
+	pairing  *pairing // to be a map of potential pairings for multiple clients
+	sessions map[string]*session
 
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
+	now        func() time.Time
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -99,34 +106,10 @@ func NewServer(cfg ServerConfig) *Server {
 		done: done,
 		err:  ErrClosed,
 		cfg:  cfg,
+		now:  time.Now,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
-}
-
-func newPairing() (pairing, error) {
-	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	if err != nil {
-		return pairing{}, fmt.Errorf("generate PIN: %w", err)
-	}
-
-	return pairing{
-		pin:  fmt.Sprintf("%06d", pin),
-		used: false,
-	}, nil
-}
-
-func (p *pairing) redeem(pin string) protocol.CloseErr {
-	if p.used {
-		return protocol.CloseErrPairingLocked
-	}
-
-	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
-		return protocol.CloseErrWrongPIN
-	}
-
-	p.used = true
-	return protocol.CloseErrNone
 }
 
 func (s *Server) buildTailcat() tailcatServer {
@@ -145,22 +128,77 @@ func (s *Server) Start() (addr string, err error) {
 		return "", ErrAlreadyStarted
 	}
 
-	p, err := newPairing()
-	if err != nil {
-		return "", fmt.Errorf("server: start: %w", err)
-	}
-
 	srv := s.newTailcat()
 	if err := srv.Start(); err != nil {
 		return "", fmt.Errorf("server: start: %w", err)
 	}
 
-	s.pairing = p
 	s.done = make(chan struct{})
 	s.err = nil
 	s.srv = srv
+	s.sessions = make(map[string]*session)
 
 	return string(srv.TailcatAddr()), nil
+}
+
+func (s *Server) NewPairing() (string, error) {
+	pin, err := newPIN()
+	if err != nil {
+		return "", err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.srv == nil {
+		return "", ErrClosed
+	}
+
+	if len(s.sessions) >= maxClients {
+		return "", ErrServerFull
+	}
+
+	s.pairing = &pairing{pin: pin, expires: s.now().Add(pairingTTL)}
+	return pin, nil
+}
+
+func newPIN() (string, error) {
+	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", fmt.Errorf("generate PIN: %w", err)
+	}
+	return fmt.Sprintf("%06d", pin), nil
+}
+
+// nil if none or expired, s.mu must be locked
+func (s *Server) pendingPairingLocked() *pairing {
+	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
+		s.pairing = nil
+	}
+	return s.pairing
+}
+
+// Attempt to redeemLocked pin, s.mu must be locked
+func (s *Server) redeemLocked(pin string) protocol.CloseErr {
+	p := s.pendingPairingLocked()
+	if p == nil {
+		return protocol.CloseErrPairingLocked
+	}
+
+	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
+		p.failures++
+		if p.failures >= maxPairingFailures {
+			s.pairing = nil
+		}
+		return protocol.CloseErrWrongPIN
+	}
+	s.pairing = nil
+	return protocol.CloseErrNone
+}
+
+func (s *Server) CancelPairing() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pairing = nil
 }
 
 func (s *Server) Stop() error {
@@ -174,14 +212,15 @@ func (s *Server) Stop() error {
 	}
 
 	srv := s.srv
-	sess := s.sess
+	sessions := s.sessions
 	done := s.done
 	s.srv = nil
-	s.sess = nil
+	s.sessions = nil
+	s.pairing = nil
 	s.err = ErrClosed
 	s.mu.Unlock()
 
-	if sess != nil {
+	for _, sess := range sessions {
 		sess.conn.Close()
 	}
 
@@ -196,17 +235,16 @@ func (s *Server) Stop() error {
 
 // send message to a client
 func (s *Server) Send(clientID string, m Message) error {
-	s.mu.Lock()
-	if s.sess == nil || s.sess.writer == nil {
-		s.mu.Unlock()
-		return ErrNotConnected
+	sess, err := s.sessionForClient(clientID)
+	if err != nil {
+		return err
 	}
 
-	if s.sess.clientInfo.ID != clientID {
-		s.mu.Unlock()
+	if sess.clientInfo.ID != clientID {
 		return ErrUnknownClient
 	}
-	w := s.sess.writer
+	s.mu.Lock()
+	w := sess.writer
 	s.mu.Unlock()
 
 	payload, err := protocol.Msg{Topic: m.Topic, Data: m.Data}.MarshalBinary()
@@ -218,18 +256,16 @@ func (s *Server) Send(clientID string, m Message) error {
 }
 
 func (s *Server) RequestStream(ctx context.Context, clientID, target string) (net.Conn, error) {
-	s.mu.Lock()
-	sess := s.sess
-	if sess == nil || sess.writer == nil {
-		s.mu.Unlock()
-		return nil, ErrNotConnected
+	sess, err := s.sessionForClient(clientID)
+	if err != nil {
+		return nil, err
 	}
 
 	if sess.clientInfo.ID != clientID {
-		s.mu.Unlock()
 		return nil, ErrUnknownClient
 	}
 
+	s.mu.Lock()
 	sess.nextStreamID++
 	id := sess.nextStreamID
 	ch := make(chan net.Conn, 1)
@@ -303,14 +339,14 @@ func (s *Server) Err() error {
 	return s.err
 }
 
-// Returns the current PIN or empty string if the server isn't running
+// Returns the current PIN or empty string there is none
 func (s *Server) PairingPIN() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.srv == nil {
-		return ""
+	if p := s.pendingPairingLocked(); p != nil {
+		return p.pin
 	}
-	return s.pairing.pin
+	return ""
 }
 
 func parseAllowedClients(clients []string) ([]key.NodePublic, error) {
@@ -441,11 +477,10 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	case keyParseErr != nil || !keyIsPeer:
 		reason = protocol.CloseErrInvalidKey
 	default:
-		reason = s.pairing.redeem(h.PIN)
+		reason = s.redeemLocked(h.PIN)
 	}
 
 	if reason == protocol.CloseErrNone {
-		s.pairing.key = *clientKey
 		sess = &session{
 			conn: conn,
 			clientInfo: ClientInfo{
@@ -454,7 +489,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 			},
 			pending: make(map[uint64]chan net.Conn),
 		}
-		s.sess = sess
+		s.sessions[clientKey.String()] = sess
 	}
 	s.mu.Unlock()
 
@@ -490,7 +525,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 func (s *Server) allowClient(k key.NodePublic) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return !s.pairing.used || s.pairing.key == k
+	return s.pendingPairingLocked() != nil || s.sessions[k.String()] != nil
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
@@ -545,6 +580,21 @@ func disconnectReason(cause error, stopped bool) error {
 	}
 }
 func (s *Server) handleStream(conn net.Conn) {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+
+	// The session is the one belonging to the key the tunnel authenticated
+	var peer key.NodePublic
+	ok := false
+	if srv != nil {
+		peer, ok = srv.PeerKey(conn.RemoteAddr())
+	}
+	if !ok {
+		conn.Close()
+		return
+	}
+
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	id, err := protocol.ReadStreamID(conn)
 	if err != nil {
@@ -555,9 +605,10 @@ func (s *Server) handleStream(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 
 	s.mu.Lock()
-	sess := s.sess
-	if sess == nil || !sameHost(conn.RemoteAddr(), sess.conn.RemoteAddr()) {
+	sess, err := s.sessionForClientLocked(peer.String())
+	if err != nil {
 		s.mu.Unlock()
+		s.cfg.Logf("meshnet: stream: %v", err)
 		conn.Close()
 		return
 	}
@@ -575,17 +626,29 @@ func (s *Server) handleStream(conn net.Conn) {
 	ch <- conn
 }
 
-func sameHost(a, b net.Addr) bool {
-	ap, err := netip.ParseAddrPort(a.String())
-	if err != nil {
-		return false
+// returns the connected session for client id, s.mu must be held
+func (s *Server) sessionForClientLocked(id string) (*session, error) {
+	if len(s.sessions) == 0 {
+		return nil, ErrNotConnected
 	}
 
-	bp, err := netip.ParseAddrPort(b.String())
-	if err != nil {
-		return false
+	sess := s.sessions[id]
+	if sess == nil {
+		return nil, ErrUnknownClient
 	}
-	return ap.Addr().String() == bp.Addr().String()
+
+	// Paired but handshake not completed
+	if sess.writer == nil {
+		return nil, ErrNotConnected
+	}
+	return sess, nil
+}
+
+// sessionForClientLocked for callers that don't hold s.mu
+func (s *Server) sessionForClient(id string) (*session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionForClientLocked(id)
 }
 
 // tear down a session
@@ -616,7 +679,7 @@ func (s *Server) endSession(sess *session, cause error) {
 func (s *Server) clearSession(sess *session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sess == sess {
-		s.sess = nil
+	if s.sessions[sess.clientInfo.ID] == sess {
+		delete(s.sessions, sess.clientInfo.ID)
 	}
 }
