@@ -95,10 +95,9 @@ func NewServer(cfg ServerConfig) *Server {
 	done := make(chan struct{})
 	close(done)
 	s := &Server{
-		done:     done,
-		err:      ErrClosed,
-		cfg:      cfg,
-		sessions: make(map[string]*session),
+		done: done,
+		err:  ErrClosed,
+		cfg:  cfg,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
@@ -159,6 +158,7 @@ func (s *Server) Start() (addr string, err error) {
 	s.done = make(chan struct{})
 	s.err = nil
 	s.srv = srv
+	s.sessions = make(map[string]*session)
 
 	return string(srv.TailcatAddr()), nil
 }

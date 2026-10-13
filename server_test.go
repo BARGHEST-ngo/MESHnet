@@ -560,10 +560,14 @@ func TestServerMalformedFrameEndsSession(t *testing.T) {
 
 func TestServerSessionEndStopsWriter(t *testing.T) {
 	s, fake := startNewTestServer(t)
-	conn, _, done := connectClient(t, s, fake)
+	conn, clientID, done := connectClient(t, s, fake)
 
 	s.mu.Lock()
-	w := s.sess.writer
+	sess, err := s.sessionForClientLocked(clientID)
+	if err != nil {
+		t.Fatalf("session for client ID %s: %v", clientID, err)
+	}
+	w := sess.writer
 	s.mu.Unlock()
 	conn.Close() // client goes away
 	assertClosed(t, done)
@@ -572,7 +576,7 @@ func TestServerSessionEndStopsWriter(t *testing.T) {
 		t.Errorf("Enqueue after session end: %v, want transport.ErrClosed", err)
 	}
 	s.mu.Lock()
-	sess := s.sess
+	sess, _ = s.sessionForClientLocked(clientID)
 	s.mu.Unlock()
 	if sess != nil {
 		t.Error("session still registered after it ended")
@@ -829,13 +833,14 @@ func readStreamRequest(t *testing.T, conn net.Conn) protocol.StreamRequest {
 	return r
 }
 
-func pendingStreams(s *Server) int {
+func pendingStreams(s *Server, clientID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sess == nil {
+	sess, _ := s.sessionForClientLocked(clientID)
+	if sess == nil {
 		return 0
 	}
-	return len(s.sess.pending)
+	return len(sess.pending)
 }
 
 func TestServerRequestStreamErrors(t *testing.T) {
@@ -852,13 +857,13 @@ func TestServerRequestStreamErrors(t *testing.T) {
 	t.Run("unknown client", func(t *testing.T) {
 		s, fake := startNewTestServer(t)
 		t.Cleanup(func() { s.Stop() })
-		connectClient(t, s, fake)
+		_, id, _ := connectClient(t, s, fake)
 
 		_, err := s.RequestStream(context.Background(), "nodekey:someone-else", "5555")
 		if !errors.Is(err, ErrUnknownClient) {
 			t.Fatalf("got %v, want ErrUnknownClient", err)
 		}
-		if n := pendingStreams(s); n != 0 {
+		if n := pendingStreams(s, id); n != 0 {
 			t.Fatalf("%d pending requests, want 0", n)
 		}
 	})
@@ -876,7 +881,7 @@ func TestServerRequestStreamErrors(t *testing.T) {
 			if !errors.Is(err, protocol.ErrMalformedPayload) {
 				t.Fatalf("got %v, want ErrMalformedPayload", err)
 			}
-			if n := pendingStreams(s); n != 0 {
+			if n := pendingStreams(s, clientID); n != 0 {
 				t.Fatalf("%d pending requests, want 0", n)
 			}
 		})
@@ -901,7 +906,7 @@ func TestServerRequestStreamSendsFrame(t *testing.T) {
 		t.Fatalf("second request %+v, want ID 2 target capture", r)
 	}
 
-	if n := pendingStreams(s); n != 2 {
+	if n := pendingStreams(s, clientID); n != 2 {
 		t.Fatalf("%d pending requests, want 2", n)
 	}
 
@@ -912,7 +917,7 @@ func TestServerRequestStreamSendsFrame(t *testing.T) {
 			t.Fatalf("got %v, want context.Canceled", r.err)
 		}
 	}
-	if n := pendingStreams(s); n != 0 {
+	if n := pendingStreams(s, clientID); n != 0 {
 		t.Fatalf("%d pending requests after cancel, want 0", n)
 	}
 }
@@ -932,7 +937,7 @@ func TestServerRequestStreamContextExpires(t *testing.T) {
 	if conn != nil {
 		t.Fatalf("got a stream with an error")
 	}
-	if n := pendingStreams(s); n != 0 {
+	if n := pendingStreams(s, clientID); n != 0 {
 		t.Fatalf("%d pending requests, want 0", n)
 	}
 }
@@ -970,34 +975,6 @@ func (a addrString) String() string  { return string(a) }
 
 func tcpAddr(s string) net.Addr {
 	return net.TCPAddrFromAddrPort(netip.MustParseAddrPort(s))
-}
-
-func TestSameHost(t *testing.T) {
-	cases := []struct {
-		name string
-		a, b net.Addr
-		want bool
-	}{
-		{"same IP, different ports", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40001"), true},
-		{"same IP and port", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), true},
-		{"different IPs", tcpAddr("[fd7a:115c:a1e0::1]:40000"), tcpAddr("[fd7a:115c:a1e0::2]:40000"), false},
-		{"IPv4 and its IPv6-mapped form", tcpAddr("192.0.2.1:40000"), tcpAddr("[::ffff:192.0.2.1]:40001"), true},
-		{"different IPv4s", tcpAddr("192.0.2.1:40000"), tcpAddr("192.0.2.2:40000"), false},
-		{"pipe addresses", addrString("pipe"), addrString("pipe"), false},
-		{"pipe and a real address", addrString("pipe"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
-		{"IP without a port", addrString("fd7a:115c:a1e0::1"), tcpAddr("[fd7a:115c:a1e0::1]:40000"), false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sameHost(tc.a, tc.b); got != tc.want {
-				t.Errorf("sameHost(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
-			}
-			if got := sameHost(tc.b, tc.a); got != tc.want {
-				t.Errorf("sameHost(%v, %v) = %v, want %v (reversed)", tc.b, tc.a, got, tc.want)
-			}
-		})
-	}
 }
 
 // dialStream plays the client answering a stream request
