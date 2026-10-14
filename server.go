@@ -23,6 +23,7 @@ type tailcatServer interface {
 	Close() error
 	TailcatAddr() tailcat.Addr
 	PeerKey(remote net.Addr) (key.NodePublic, bool)
+	DisconnectClient(k key.NodePublic) bool
 }
 
 type ServerConfig struct {
@@ -33,17 +34,17 @@ type ServerConfig struct {
 	LivenessTimeout      time.Duration // Minimum 20s
 }
 
-// session is the state for one paired client's connection
-// Stop uses it to close the connection, Send (will) write to it.
-// per-client state will live here (writer queue, liveness, streams)
-// currently one per server run
+// session is one paired client's connection
+// one per connected client
 type session struct {
 	conn         net.Conn
 	clientInfo   ClientInfo
+	key          key.NodePublic
 	writer       *transport.Writer
 	nextStreamID uint64
 	pending      map[uint64]chan net.Conn
 	streams      []net.Conn
+	endReason    error
 }
 
 type pairing struct {
@@ -240,9 +241,6 @@ func (s *Server) Send(clientID string, m Message) error {
 		return err
 	}
 
-	if sess.clientInfo.ID != clientID {
-		return ErrUnknownClient
-	}
 	s.mu.Lock()
 	w := sess.writer
 	s.mu.Unlock()
@@ -259,10 +257,6 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	sess, err := s.sessionForClient(clientID)
 	if err != nil {
 		return nil, err
-	}
-
-	if sess.clientInfo.ID != clientID {
-		return nil, ErrUnknownClient
 	}
 
 	s.mu.Lock()
@@ -320,6 +314,22 @@ func enqueueErr(err error) error {
 func (s *Server) Clients() []ClientInfo {
 	// TODO
 	return make([]ClientInfo, 0)
+}
+
+// DisconnectClient ends the session of the client with this ID and removes the client from the tunnel
+// It returns after the client's slot is freed, NewPairing can be called immediately
+func (s *Server) DisconnectClient(clientID string) error {
+	sess, err := s.sessionForClient(clientID)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	sess.endReason = ErrDisconnectedByServer
+	s.mu.Unlock()
+	s.clearSession(sess)
+	sess.conn.Close()
+	return nil
 }
 
 // Done returns a channel that is closed when the current server has fully stopped and the tailcat server has closed
@@ -488,6 +498,7 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 				Name: h.Name,
 			},
 			pending: make(map[uint64]chan net.Conn),
+			key:     *clientKey,
 		}
 		s.sessions[clientKey.String()] = sess
 	}
@@ -652,34 +663,44 @@ func (s *Server) sessionForClient(id string) (*session, error) {
 }
 
 // tear down a session
-// close the conn and unblock a writer stuck on a dead peer
-// stop the writer and clear it
+// clearSession must be run before the stream list is read
+// once the session is out of the map handleStream cannot add any new streams
 func (s *Server) endSession(sess *session, cause error) {
 	sess.conn.Close()
+	s.clearSession(sess)
 
 	s.mu.Lock()
 	w := sess.writer
 	stopped := s.srv == nil
 	streams := sess.streams
+	reason := sess.endReason
 	s.mu.Unlock()
+
 	if w != nil {
 		w.Close()
 	}
-
 	for _, stream := range streams {
 		stream.Close()
 	}
-	s.clearSession(sess)
 
-	reason := disconnectReason(cause, stopped)
+	if reason == nil {
+		reason = disconnectReason(cause, stopped)
+	}
 	s.cfg.Logf("meshnet: client %s disconnected: %v", sess.clientInfo.ID, reason)
 	s.cfg.OnClientDisconnected(sess.clientInfo, reason)
 }
 
+// clearSession removes sess from the server and revokes its key on the tunnel
+// tailcat drops the peer and the allowClient hook won't let it back in
 func (s *Server) clearSession(sess *session) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	srv := s.srv
 	if s.sessions[sess.clientInfo.ID] == sess {
 		delete(s.sessions, sess.clientInfo.ID)
+	}
+	s.mu.Unlock()
+
+	if srv != nil {
+		srv.DisconnectClient(sess.key)
 	}
 }
