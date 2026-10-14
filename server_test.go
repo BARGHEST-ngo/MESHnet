@@ -20,10 +20,11 @@ import (
 )
 
 type fakeTailcat struct {
-	mu         sync.Mutex
-	peers      map[netip.Addr]key.NodePublic
-	closeCalls atomic.Int32
-	connected  chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
+	mu           sync.Mutex
+	peers        map[netip.Addr]key.NodePublic
+	closeCalls   atomic.Int32
+	connected    chan string // client IDs, signalled by newTestServer's OnClientConnected wrapper
+	disconnected chan string
 }
 
 const fakeAddress = "fake-address"
@@ -39,6 +40,14 @@ func (f *fakeTailcat) Start() error {
 func (f *fakeTailcat) Close() error {
 	f.closeCalls.Add(1)
 	return nil
+}
+
+func (f *fakeTailcat) DisconnectClient(k key.NodePublic) bool {
+	select {
+	case f.disconnected <- k.String():
+	default:
+	}
+	return true
 }
 
 func (f *fakeTailcat) addPeer(addr net.Addr, k key.NodePublic) {
@@ -65,8 +74,9 @@ func (f *fakeTailcat) PeerKey(remote net.Addr) (key.NodePublic, bool) {
 func newTestServer(t *testing.T, setup func(cfg *ServerConfig)) (*Server, *fakeTailcat) {
 	t.Helper()
 	fake := &fakeTailcat{
-		connected: make(chan string, 4),
-		peers:     make(map[netip.Addr]key.NodePublic),
+		connected:    make(chan string, 4),
+		disconnected: make(chan string, 4),
+		peers:        make(map[netip.Addr]key.NodePublic),
 	}
 	cfg := &ServerConfig{}
 	if setup != nil {
@@ -1433,4 +1443,92 @@ func TestServerPairAgainWithoutRestart(t *testing.T) {
 	if err := s.Send(firstID, Message{Topic: "status"}); !errors.Is(err, ErrUnknownClient) {
 		t.Fatalf("Send to the first client: %v, want ErrUnknownClient", err)
 	}
+}
+
+func TestServerSessionEndRevokesKey(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	conn, clientID, done := connectClient(t, s, fake)
+	paired, _ := parseKey(clientID)
+
+	conn.Close() // the client goes away
+	assertClosed(t, done)
+
+	if got := next(t, fake.disconnected); got != clientID {
+		t.Fatalf("tailcat told to drop %s, want %s", got, clientID)
+	}
+	if s.allowClient(*paired) {
+		t.Fatal("the revoked key is still allowed onto the tunnel")
+	}
+}
+
+func TestServerDisconnectClient(t *testing.T) {
+	var l *lifecycle
+	s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+	startPairing(t, s)
+	t.Cleanup(func() { s.Stop() })
+	_, clientID, done := connectClient(t, s, fake)
+
+	if err := s.DisconnectClient(clientID); err != nil {
+		t.Fatalf("DisconnectClient: %v", err)
+	}
+
+	ev := next(t, l.disconnected)
+	if ev.info.ID != clientID || !errors.Is(ev.err, ErrDisconnectedByServer) {
+		t.Fatalf("disconnected %s with %v, want %s with ErrDisconnectedByServer", ev.info.ID, ev.err, clientID)
+	}
+	if got := next(t, fake.disconnected); got != clientID {
+		t.Fatalf("tailcat told to drop %s, want %s", got, clientID)
+	}
+	assertClosed(t, done)
+	if err := s.Send(clientID, Message{Topic: "status"}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("Send after DisconnectClient: %v, want ErrNotConnected", err)
+	}
+}
+
+func TestServerDisconnectClientErrors(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+
+	if err := s.DisconnectClient("nodekey:nobody"); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("no client connected: %v, want ErrNotConnected", err)
+	}
+
+	connectClient(t, s, fake)
+	if err := s.DisconnectClient("nodekey:someone-else"); !errors.Is(err, ErrUnknownClient) {
+		t.Fatalf("unknown client: %v, want ErrUnknownClient", err)
+	}
+}
+
+func TestServerDisconnectClientFreesSlot(t *testing.T) {
+	s, fake := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+	_, clientID, _ := connectClient(t, s, fake)
+
+	if _, err := s.NewPairing(); !errors.Is(err, ErrServerFull) {
+		t.Fatalf("NewPairing with a client connected: %v, want ErrServerFull", err)
+	}
+	if err := s.DisconnectClient(clientID); err != nil {
+		t.Fatalf("DisconnectClient: %v", err)
+	}
+	if _, err := s.NewPairing(); err != nil {
+		t.Fatalf("NewPairing straight after DisconnectClient: %v", err)
+	}
+}
+
+func TestServerStopDoesNotRevokeKeys(t *testing.T) {
+	var l *lifecycle
+	s, fake := newTestServer(t, func(cfg *ServerConfig) { l = recordLifecycle(cfg) })
+	startPairing(t, s)
+	_, _, done := connectClient(t, s, fake)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	assertClosed(t, done)
+
+	if ev := next(t, l.disconnected); !errors.Is(ev.err, ErrClosed) {
+		t.Fatalf("disconnected with %v, want ErrClosed", ev.err)
+	}
+	none(t, fake.disconnected)
 }

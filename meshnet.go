@@ -13,13 +13,14 @@ const (
 )
 
 var (
-	ErrClosed         = errors.New("meshnet: closed")
-	ErrAlreadyStarted = errors.New("meshnet: already started")
-	ErrNotConnected   = errors.New("meshnet: not connected")
-	ErrUnknownClient  = errors.New("meshnet: unknown clientID")
-	ErrSendQueueFull  = errors.New("meshnet: too many messages enqueued")
-	ErrServerClosed   = errors.New("meshnet: server closed the connection")
-	ErrServerFull     = errors.New("meshnet: maximum clients connected")
+	ErrClosed               = errors.New("meshnet: closed")
+	ErrAlreadyStarted       = errors.New("meshnet: already started")
+	ErrNotConnected         = errors.New("meshnet: not connected")
+	ErrUnknownClient        = errors.New("meshnet: unknown clientID")
+	ErrSendQueueFull        = errors.New("meshnet: too many messages enqueued")
+	ErrServerClosed         = errors.New("meshnet: server closed the connection")
+	ErrServerFull           = errors.New("meshnet: maximum clients connected")
+	ErrDisconnectedByServer = errors.New("meshnet: client removed by server")
 )
 
 func (s State) String() string {
