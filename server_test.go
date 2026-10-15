@@ -1277,7 +1277,7 @@ func TestServerWrongPINs(t *testing.T) {
 		t.Cleanup(func() { s.Stop() })
 		pin := s.PairingPIN()
 
-		for i := range maxPairingFailures - 1 {
+		for i := range maxFailuresPerPIN - 1 {
 			if got := tryPairPIN(t, s, newPeer(fake), "000000"); got != protocol.CloseErrWrongPIN {
 				t.Fatalf("wrong PIN %d: %v, want wrong_pin", i, got)
 			}
@@ -1292,7 +1292,7 @@ func TestServerWrongPINs(t *testing.T) {
 		t.Cleanup(func() { s.Stop() })
 		pin := s.PairingPIN()
 
-		for i := range maxPairingFailures {
+		for i := range maxFailuresPerPIN {
 			if got := tryPairPIN(t, s, newPeer(fake), "000000"); got != protocol.CloseErrWrongPIN {
 				t.Fatalf("wrong PIN %d: %v, want wrong_pin", i, got)
 			}
@@ -1510,4 +1510,49 @@ func TestServerListClients(t *testing.T) {
 			t.Errorf("client still listed after disconnecting")
 		}
 	})
+}
+
+func TestServerPairingExhaustedAcrossPairings(t *testing.T) {
+	s, fake := newTestServer(t, nil)
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { s.Stop() })
+
+	var pin string
+	failures, perPIN := 0, 0
+	for failures < maxPairingFailures {
+		if perPIN == 0 {
+			var err error
+			if pin, err = s.NewPairing(); err != nil {
+				t.Fatalf("NewPairing after %d failures: %v", failures, err)
+			}
+		}
+		if got := tryPairPIN(t, s, newPeer(fake), "000000"); got != protocol.CloseErrWrongPIN {
+			t.Fatalf("wrong PIN %d: %v, want wrong_pin", failures, got)
+		}
+		failures++
+		perPIN = (perPIN + 1) % maxFailuresPerPIN
+	}
+
+	if err := tryPairPIN(t, s, newPeer(fake), pin); err != protocol.CloseErrPairingLocked {
+		t.Fatalf("right PIN after the run's limit: %v, want pairing_locked", err)
+	}
+	if _, err := s.NewPairing(); !errors.Is(err, ErrPairingExhausted) {
+		t.Fatalf("NewPairing after the run's limit: %v, want ErrPairingExhausted", err)
+	}
+}
+
+func TestServerWrongKeysExhaustPairing(t *testing.T) {
+	s, _ := startNewTestServer(t)
+	t.Cleanup(func() { s.Stop() })
+
+	for i := range maxPairingFailures {
+		if err := tryPair(t, s, key.NewNode().Public()); err != protocol.CloseErrInvalidKey {
+			t.Fatalf("wrong key %d: %v, want invalid_key", i, err)
+		}
+	}
+	if _, err := s.NewPairing(); !errors.Is(err, ErrPairingExhausted) {
+		t.Fatalf("NewPairing after forged keys: %v, want ErrPairingExhausted", err)
+	}
 }

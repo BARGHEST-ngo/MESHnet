@@ -54,19 +54,21 @@ type pairing struct {
 
 const (
 	pairingTTL         = 10 * time.Minute
-	maxPairingFailures = 3
+	maxFailuresPerPIN  = 3  // max wrong PINs per pairing
+	maxPairingFailures = 10 // max failed pairings per server run (Wrong PIN or key)
 	// Starting at 1, may be configurable
 	// Note - pairing below and relevant functions assume only one pairing at once
 	maxClients = 1
 )
 
 type Server struct {
-	mu       sync.Mutex // guards all before line break
-	srv      tailcatServer
-	done     chan struct{}
-	err      error
-	pairing  *pairing // to be a map of potential pairings for multiple clients
-	sessions map[string]*session
+	mu              sync.Mutex // guards all before line break
+	srv             tailcatServer
+	done            chan struct{}
+	err             error
+	pairing         *pairing // to be a map of potential pairings for multiple clients
+	sessions        map[string]*session
+	pairingFailures int
 
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
@@ -137,6 +139,7 @@ func (s *Server) Start() (addr string, err error) {
 	s.err = nil
 	s.srv = srv
 	s.sessions = make(map[string]*session)
+	s.pairingFailures = 0
 
 	return string(srv.TailcatAddr()), nil
 }
@@ -151,6 +154,10 @@ func (s *Server) NewPairing() (string, error) {
 	defer s.mu.Unlock()
 	if s.srv == nil {
 		return "", ErrClosed
+	}
+
+	if s.pairingFailures >= maxPairingFailures {
+		return "", ErrPairingExhausted
 	}
 
 	if len(s.sessions) >= maxClients {
@@ -186,7 +193,8 @@ func (s *Server) redeemLocked(pin string) protocol.CloseErr {
 
 	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
 		p.failures++
-		if p.failures >= maxPairingFailures {
+		s.pairingFailures++
+		if p.failures >= maxFailuresPerPIN || s.pairingFailures >= maxPairingFailures {
 			s.pairing = nil
 		}
 		return protocol.CloseErrWrongPIN
@@ -475,6 +483,10 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 		reason = protocol.CloseErrVersionMismatch
 	case keyParseErr != nil || !keyIsPeer:
 		reason = protocol.CloseErrInvalidKey
+		s.pairingFailures++
+		if s.pairingFailures >= maxPairingFailures {
+			s.pairing = nil
+		}
 	default:
 		reason = s.redeemLocked(h.PIN)
 	}
