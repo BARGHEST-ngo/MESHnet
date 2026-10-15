@@ -2,17 +2,12 @@ package meshnet
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
-	"errors"
 	"fmt"
-	"math/big"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
-	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
@@ -25,31 +20,6 @@ const (
 	// Note - pairing below and relevant functions assume only one pairing at once
 	maxClients = 1
 )
-
-// session is one paired client's connection
-// one per connected client
-type session struct {
-	conn         net.Conn
-	clientInfo   ClientInfo
-	key          key.NodePublic
-	writer       *transport.Writer
-	nextStreamID uint64
-	pending      map[uint64]chan net.Conn
-	streams      []net.Conn
-	endReason    error
-}
-
-type pairing struct {
-	pin      string
-	expires  time.Time
-	failures int
-}
-
-type clientCloseError struct{ reason protocol.CloseErr }
-
-func (e clientCloseError) Error() string {
-	return "meshnet: client closed: " + e.reason.String()
-}
 
 type ServerConfig struct {
 	Logf                 func(format string, args ...any)
@@ -199,9 +169,10 @@ func (s *Server) Send(clientID string, m Message) error {
 		return err
 	}
 
-	s.mu.Lock()
-	w := sess.writer
-	s.mu.Unlock()
+	w, err := sess.sender()
+	if err != nil {
+		return err
+	}
 
 	payload, err := protocol.Msg{Topic: m.Topic, Data: m.Data}.MarshalBinary()
 	if err != nil {
@@ -217,20 +188,17 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 		return nil, err
 	}
 
-	s.mu.Lock()
-	sess.nextStreamID++
-	id := sess.nextStreamID
-	ch := make(chan net.Conn, 1)
-	sess.pending[id] = ch
-	w := sess.writer
-	s.mu.Unlock()
+	id, ch, w, err := sess.requestStream()
+	if err != nil {
+		return nil, err
+	}
 
 	payload, err := protocol.StreamRequest{ID: id, Target: target}.MarshalBinary()
 	if err == nil {
 		err = enqueueErr(w.Enqueue(protocol.Frame{Kind: protocol.KindStreamRequest, Payload: payload}))
 	}
 	if err != nil {
-		s.dropPendingStream(sess, id)
+		sess.cancelStream(id)
 		return nil, err
 	}
 
@@ -238,7 +206,7 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	case conn := <-ch:
 		return conn, nil
 	case <-ctx.Done():
-		s.dropPendingStream(sess, id)
+		sess.cancelStream(id)
 		select { // the handler may have delivered just before we dropped it
 		case conn := <-ch:
 			conn.Close()
@@ -246,7 +214,7 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 		}
 		return nil, ctx.Err()
 	case <-w.Done():
-		s.dropPendingStream(sess, id)
+		sess.cancelStream(id)
 		return nil, ErrNotConnected
 	}
 }
@@ -259,9 +227,11 @@ func (s *Server) DisconnectClient(clientID string) error {
 		return err
 	}
 
-	s.mu.Lock()
-	sess.endReason = ErrDisconnectedByServer
-	s.mu.Unlock()
+	if _, err := sess.sender(); err != nil {
+		return err // handshake pending or already closed
+	}
+
+	sess.endedBy(ErrDisconnectedByServer)
 	s.clearSession(sess)
 	sess.conn.Close()
 	return nil
@@ -333,376 +303,5 @@ func (s *Server) dispatch(port uint16) func(net.Conn) {
 		return s.handleStream
 	default:
 		return nil
-	}
-}
-
-func (s *Server) allowClient(k key.NodePublic) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pendingPairingLocked() != nil || s.sessions[k.String()] != nil
-}
-
-func (s *Server) handleControl(conn net.Conn) {
-	sess, ok := s.handleShake(conn)
-	if !ok {
-		conn.Close()
-		return
-	}
-	s.cfg.OnClientConnected(sess.clientInfo)
-
-	cause := s.serve(sess)
-	s.endSession(sess, cause)
-}
-
-func (s *Server) handleShake(conn net.Conn) (*session, bool) {
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	f, err := protocol.ReadFrame(conn)
-	if err != nil {
-		s.cfg.Logf("handleShake: %v", err)
-		return nil, false
-	}
-
-	if f.Kind != protocol.KindHello {
-		s.cfg.Logf("handleshake: unexpected frame %v", f.Kind)
-		return nil, false
-	}
-
-	var h protocol.Hello
-	if err := h.UnmarshalBinary(f.Payload); err != nil {
-		c := protocol.Close{
-			Err:     protocol.CloseErrError,
-			Message: "malformed hello payload",
-		}
-
-		if err := protocol.WritePayload(conn, protocol.KindClose, c); err != nil {
-			s.cfg.Logf("handleShake: %v", err)
-		}
-		return nil, false
-	}
-
-	clientKey, keyParseErr := parseKey(h.Key)
-	s.mu.Lock()
-	srv := s.srv
-	s.mu.Unlock()
-
-	keyIsPeer := false
-	if srv != nil && keyParseErr == nil {
-		peer, ok := srv.PeerKey(conn.RemoteAddr())
-		keyIsPeer = ok && peer == *clientKey
-	}
-
-	s.mu.Lock()
-	var reason protocol.CloseErr
-	var sess *session
-	switch {
-	case h.Version != protocol.Version:
-		reason = protocol.CloseErrVersionMismatch
-	case keyParseErr != nil || !keyIsPeer:
-		reason = protocol.CloseErrInvalidKey
-		s.pairingFailures++
-		if s.pairingFailures >= maxPairingFailures {
-			s.pairing = nil
-		}
-	default:
-		reason = s.redeemLocked(h.PIN)
-	}
-
-	if reason == protocol.CloseErrNone {
-		sess = &session{
-			conn: conn,
-			clientInfo: ClientInfo{
-				ID:   clientKey.String(),
-				Name: h.Name,
-			},
-			pending: make(map[uint64]chan net.Conn),
-			key:     *clientKey,
-		}
-		s.sessions[clientKey.String()] = sess
-	}
-	s.mu.Unlock()
-
-	if reason != protocol.CloseErrNone {
-		c := protocol.Close{
-			Err: reason,
-		}
-		if err := protocol.WritePayload(conn, protocol.KindClose, c); err != nil {
-			s.cfg.Logf("handleShake: %v", err)
-		}
-		return nil, false
-	}
-
-	if err := protocol.WritePayload(conn, protocol.KindHelloAck, protocol.HelloAck{
-		Version:  protocol.Version,
-		ClientID: sess.clientInfo.ID,
-	}); err != nil {
-		s.cfg.Logf("handleShake: %v", err)
-		s.clearSession(sess)
-		return nil, false
-	}
-
-	w := transport.NewWriter(conn)
-	s.mu.Lock()
-	sess.writer = w
-	s.mu.Unlock()
-
-	conn.SetDeadline(time.Time{})
-
-	return sess, true
-}
-
-func newPIN() (string, error) {
-	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	if err != nil {
-		return "", fmt.Errorf("generate PIN: %w", err)
-	}
-	return fmt.Sprintf("%06d", pin), nil
-}
-
-// nil if none or expired, s.mu must be locked
-func (s *Server) pendingPairingLocked() *pairing {
-	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
-		s.pairing = nil
-	}
-	return s.pairing
-}
-
-// Attempt to redeem pin, s.mu must be locked
-func (s *Server) redeemLocked(pin string) protocol.CloseErr {
-	p := s.pendingPairingLocked()
-	if p == nil {
-		return protocol.CloseErrPairingLocked
-	}
-
-	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
-		p.failures++
-		s.pairingFailures++
-		if p.failures >= maxFailuresPerPIN || s.pairingFailures >= maxPairingFailures {
-			s.pairing = nil
-		}
-		return protocol.CloseErrWrongPIN
-	}
-	s.pairing = nil
-	return protocol.CloseErrNone
-}
-
-func parseKey(k string) (*key.NodePublic, error) {
-	out := &key.NodePublic{}
-	if err := out.UnmarshalText([]byte(k)); err != nil {
-		return nil, fmt.Errorf("server: parse key: %q: %w", k, err)
-	}
-
-	if out.IsZero() {
-		return nil, fmt.Errorf("server: parse key: %q: invalid key", k)
-	}
-	return out, nil
-}
-
-func (s *Server) serve(sess *session) error {
-	r := deadlineReader{
-		conn:    sess.conn,
-		timeout: s.cfg.LivenessTimeout,
-	}
-	for {
-		f, err := protocol.ReadFrame(r)
-		if err != nil {
-			return timeoutErr(err)
-		}
-
-		if err := s.handleFrame(sess, f); err != nil {
-			return err // Client close, malformed frame
-		}
-	}
-}
-
-func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
-	switch f.Kind {
-	case protocol.KindMsg:
-		return s.handleMsg(sess, f)
-	case protocol.KindClose:
-		return s.handleClose(sess, f)
-	case protocol.KindPing:
-		return s.handlePing(sess, f)
-	default:
-		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
-	}
-}
-
-func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
-	var m protocol.Msg
-	if err := m.UnmarshalBinary(f.Payload); err != nil {
-		return err
-	}
-
-	s.cfg.OnMessage(sess.clientInfo.ID, Message{Topic: m.Topic, Data: m.Data})
-	return nil
-}
-
-func (s *Server) handlePing(sess *session, f protocol.Frame) error {
-	if len(f.Payload) != 0 {
-		return fmt.Errorf("ping: %w", protocol.ErrMalformedPayload)
-	}
-
-	err := sess.writer.Enqueue(protocol.Frame{Kind: protocol.KindPong})
-	if err != nil && !errors.Is(err, transport.ErrFull) {
-		return fmt.Errorf("ping: %w", err)
-	}
-	// Full queue is fine, queued frames are traffic
-	return nil
-}
-
-func (s *Server) handleClose(sess *session, f protocol.Frame) error {
-	var cl protocol.Close
-	if err := cl.UnmarshalBinary(f.Payload); err != nil {
-		return err
-	}
-
-	return clientCloseError{reason: cl.Err}
-}
-
-func (s *Server) handleStream(conn net.Conn) {
-	s.mu.Lock()
-	srv := s.srv
-	s.mu.Unlock()
-
-	// The session is the one belonging to the key the tunnel authenticated
-	var peer key.NodePublic
-	ok := false
-	if srv != nil {
-		peer, ok = srv.PeerKey(conn.RemoteAddr())
-	}
-	if !ok {
-		conn.Close()
-		return
-	}
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	id, err := protocol.ReadStreamID(conn)
-	if err != nil {
-		s.cfg.Logf("meshnet: stream: %v", err)
-		conn.Close()
-		return
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	s.mu.Lock()
-	sess, err := s.sessionForClientLocked(peer.String())
-	if err != nil {
-		s.mu.Unlock()
-		s.cfg.Logf("meshnet: stream: %v", err)
-		conn.Close()
-		return
-	}
-
-	ch, ok := sess.pending[id]
-	delete(sess.pending, id)
-	if ok {
-		sess.streams = append(sess.streams, conn)
-	}
-	s.mu.Unlock()
-	if !ok {
-		conn.Close()
-		return
-	}
-	ch <- conn
-}
-
-func (s *Server) dropPendingStream(sess *session, id uint64) {
-	s.mu.Lock()
-	delete(sess.pending, id)
-	s.mu.Unlock()
-}
-
-func enqueueErr(err error) error {
-	if errors.Is(err, transport.ErrFull) {
-		return ErrSendQueueFull
-	}
-
-	if errors.Is(err, transport.ErrClosed) {
-		return ErrNotConnected
-	}
-
-	return err
-}
-
-// Convert why a session ended into what an app is told
-// stopped is true when the server was stopping at the time
-func disconnectReason(cause error, stopped bool) error {
-	var ce clientCloseError
-	switch {
-	case stopped:
-		return ErrClosed
-	case errors.As(cause, &ce) && ce.reason == protocol.CloseErrNone:
-		return nil // clean disconnect
-	default:
-		return cause // closed with a reason
-	}
-}
-
-// returns the connected session for client id, s.mu must be held
-func (s *Server) sessionForClientLocked(id string) (*session, error) {
-	if len(s.sessions) == 0 {
-		return nil, ErrNotConnected
-	}
-
-	sess := s.sessions[id]
-	if sess == nil {
-		return nil, ErrUnknownClient
-	}
-
-	// Paired but handshake not completed
-	if sess.writer == nil {
-		return nil, ErrNotConnected
-	}
-	return sess, nil
-}
-
-// sessionForClientLocked for callers that don't hold s.mu
-func (s *Server) sessionForClient(id string) (*session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sessionForClientLocked(id)
-}
-
-// tear down a session
-// clearSession must be run before the stream list is read
-// once the session is out of the map handleStream cannot add any new streams
-func (s *Server) endSession(sess *session, cause error) {
-	sess.conn.Close()
-	s.clearSession(sess)
-
-	s.mu.Lock()
-	w := sess.writer
-	stopped := s.srv == nil
-	streams := sess.streams
-	reason := sess.endReason
-	s.mu.Unlock()
-
-	if w != nil {
-		w.Close()
-	}
-	for _, stream := range streams {
-		stream.Close()
-	}
-
-	if reason == nil {
-		reason = disconnectReason(cause, stopped)
-	}
-	s.cfg.Logf("meshnet: client %s disconnected: %v", sess.clientInfo.ID, reason)
-	s.cfg.OnClientDisconnected(sess.clientInfo, reason)
-}
-
-// clearSession removes sess from the server and revokes its key on the tunnel
-// tailcat drops the peer and the allowClient hook won't let it back in
-func (s *Server) clearSession(sess *session) {
-	s.mu.Lock()
-	srv := s.srv
-	if s.sessions[sess.clientInfo.ID] == sess {
-		delete(s.sessions, sess.clientInfo.ID)
-	}
-	s.mu.Unlock()
-
-	if srv != nil {
-		srv.DisconnectClient(sess.key)
 	}
 }

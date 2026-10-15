@@ -526,13 +526,15 @@ func TestServerSessionEndStopsWriter(t *testing.T) {
 	s, fake := startNewTestServer(t)
 	conn, clientID, done := connectClient(t, s, fake)
 
-	s.mu.Lock()
 	sess, err := s.sessionForClientLocked(clientID)
 	if err != nil {
 		t.Fatalf("session for client ID %s: %v", clientID, err)
 	}
-	w := sess.writer
-	s.mu.Unlock()
+	w, err := sess.sender()
+	if err != nil {
+		t.Fatalf("writer for client ID %s: %v", clientID, err)
+	}
+
 	conn.Close() // client goes away
 	assertClosed(t, done)
 
@@ -790,12 +792,12 @@ func readStreamRequest(t *testing.T, conn net.Conn) protocol.StreamRequest {
 }
 
 func pendingStreams(s *Server, clientID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, _ := s.sessionForClientLocked(clientID)
-	if sess == nil {
+	sess, err := s.sessionForClient(clientID)
+	if err != nil {
 		return 0
 	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
 	return len(sess.pending)
 }
 
