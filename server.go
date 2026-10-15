@@ -17,21 +17,14 @@ import (
 	"tailscale.com/types/key"
 )
 
-type tailcatServer interface {
-	Start() error
-	Close() error
-	TailcatAddr() tailcat.Addr
-	PeerKey(remote net.Addr) (key.NodePublic, bool)
-	DisconnectClient(k key.NodePublic) bool
-}
-
-type ServerConfig struct {
-	Logf                 func(format string, args ...any)
-	OnMessage            func(clientID string, m Message)
-	OnClientConnected    func(c ClientInfo)
-	OnClientDisconnected func(c ClientInfo, e error)
-	LivenessTimeout      time.Duration // Minimum 20s
-}
+const (
+	pairingTTL         = 10 * time.Minute
+	maxFailuresPerPIN  = 3  // max wrong PINs per pairing
+	maxPairingFailures = 10 // max failed pairings per server run (Wrong PIN or key)
+	// Starting at 1, may be configurable
+	// Note - pairing below and relevant functions assume only one pairing at once
+	maxClients = 1
+)
 
 // session is one paired client's connection
 // one per connected client
@@ -52,14 +45,19 @@ type pairing struct {
 	failures int
 }
 
-const (
-	pairingTTL         = 10 * time.Minute
-	maxFailuresPerPIN  = 3  // max wrong PINs per pairing
-	maxPairingFailures = 10 // max failed pairings per server run (Wrong PIN or key)
-	// Starting at 1, may be configurable
-	// Note - pairing below and relevant functions assume only one pairing at once
-	maxClients = 1
-)
+type clientCloseError struct{ reason protocol.CloseErr }
+
+func (e clientCloseError) Error() string {
+	return "meshnet: client closed: " + e.reason.String()
+}
+
+type ServerConfig struct {
+	Logf                 func(format string, args ...any)
+	OnMessage            func(clientID string, m Message)
+	OnClientConnected    func(c ClientInfo)
+	OnClientDisconnected func(c ClientInfo, e error)
+	LivenessTimeout      time.Duration // Minimum 20s
+}
 
 type Server struct {
 	mu              sync.Mutex // guards all before line break
@@ -73,6 +71,14 @@ type Server struct {
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
 	now        func() time.Time
+}
+
+type tailcatServer interface {
+	Start() error
+	Close() error
+	TailcatAddr() tailcat.Addr
+	PeerKey(remote net.Addr) (key.NodePublic, bool)
+	DisconnectClient(k key.NodePublic) bool
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -112,15 +118,6 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s.newTailcat = s.buildTailcat
 	return s
-}
-
-func (s *Server) buildTailcat() tailcatServer {
-	srv := &tailcat.Server{
-		OnTCP:       s.dispatch,
-		Logf:        s.cfg.Logf,
-		AllowClient: s.allowClient,
-	}
-	return srv
 }
 
 func (s *Server) Start() (addr string, err error) {
@@ -168,77 +165,31 @@ func (s *Server) NewPairing() (string, error) {
 	return pin, nil
 }
 
-func newPIN() (string, error) {
-	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	if err != nil {
-		return "", fmt.Errorf("generate PIN: %w", err)
-	}
-	return fmt.Sprintf("%06d", pin), nil
-}
-
-// nil if none or expired, s.mu must be locked
-func (s *Server) pendingPairingLocked() *pairing {
-	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
-		s.pairing = nil
-	}
-	return s.pairing
-}
-
-// Attempt to redeemLocked pin, s.mu must be locked
-func (s *Server) redeemLocked(pin string) protocol.CloseErr {
-	p := s.pendingPairingLocked()
-	if p == nil {
-		return protocol.CloseErrPairingLocked
-	}
-
-	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
-		p.failures++
-		s.pairingFailures++
-		if p.failures >= maxFailuresPerPIN || s.pairingFailures >= maxPairingFailures {
-			s.pairing = nil
-		}
-		return protocol.CloseErrWrongPIN
-	}
-	s.pairing = nil
-	return protocol.CloseErrNone
-}
-
 func (s *Server) CancelPairing() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pairing = nil
 }
 
-func (s *Server) Stop() error {
+// Returns the current PIN or empty string if there is none
+func (s *Server) PairingPIN() string {
 	s.mu.Lock()
-	if s.srv == nil {
-		// Not running or already shutting down
-		done := s.done
-		s.mu.Unlock()
-		<-done
-		return nil
+	defer s.mu.Unlock()
+	if p := s.pendingPairingLocked(); p != nil {
+		return p.pin
 	}
+	return ""
+}
 
-	srv := s.srv
-	sessions := s.sessions
-	done := s.done
-	s.srv = nil
-	s.sessions = nil
-	s.pairing = nil
-	s.err = ErrClosed
-	s.mu.Unlock()
+func (s *Server) Clients() []ClientInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for _, sess := range sessions {
-		sess.conn.Close()
+	out := make([]ClientInfo, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		out = append(out, sess.clientInfo)
 	}
-
-	err := srv.Close()
-	close(done)
-	if err != nil {
-		return fmt.Errorf("server: stop: %w", err)
-	}
-
-	return err
+	return out
 }
 
 // send message to a client
@@ -300,35 +251,6 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	}
 }
 
-func (s *Server) dropPendingStream(sess *session, id uint64) {
-	s.mu.Lock()
-	delete(sess.pending, id)
-	s.mu.Unlock()
-}
-
-func enqueueErr(err error) error {
-	if errors.Is(err, transport.ErrFull) {
-		return ErrSendQueueFull
-	}
-
-	if errors.Is(err, transport.ErrClosed) {
-		return ErrNotConnected
-	}
-
-	return err
-}
-
-func (s *Server) Clients() []ClientInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	out := make([]ClientInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		out = append(out, sess.clientInfo)
-	}
-	return out
-}
-
 // DisconnectClient ends the session of the client with this ID and removes the client from the tunnel
 // It returns after the client's slot is freed, NewPairing can be called immediately
 func (s *Server) DisconnectClient(clientID string) error {
@@ -343,6 +265,38 @@ func (s *Server) DisconnectClient(clientID string) error {
 	s.clearSession(sess)
 	sess.conn.Close()
 	return nil
+}
+
+func (s *Server) Stop() error {
+	s.mu.Lock()
+	if s.srv == nil {
+		// Not running or already shutting down
+		done := s.done
+		s.mu.Unlock()
+		<-done
+		return nil
+	}
+
+	srv := s.srv
+	sessions := s.sessions
+	done := s.done
+	s.srv = nil
+	s.sessions = nil
+	s.pairing = nil
+	s.err = ErrClosed
+	s.mu.Unlock()
+
+	for _, sess := range sessions {
+		sess.conn.Close()
+	}
+
+	err := srv.Close()
+	close(done)
+	if err != nil {
+		return fmt.Errorf("server: stop: %w", err)
+	}
+
+	return err
 }
 
 // Done returns a channel that is closed when the current server has fully stopped and the tailcat server has closed
@@ -362,26 +316,13 @@ func (s *Server) Err() error {
 	return s.err
 }
 
-// Returns the current PIN or empty string there is none
-func (s *Server) PairingPIN() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p := s.pendingPairingLocked(); p != nil {
-		return p.pin
+func (s *Server) buildTailcat() tailcatServer {
+	srv := &tailcat.Server{
+		OnTCP:       s.dispatch,
+		Logf:        s.cfg.Logf,
+		AllowClient: s.allowClient,
 	}
-	return ""
-}
-
-func parseKey(k string) (*key.NodePublic, error) {
-	out := &key.NodePublic{}
-	if err := out.UnmarshalText([]byte(k)); err != nil {
-		return nil, fmt.Errorf("server: parse key: %q: %w", k, err)
-	}
-
-	if out.IsZero() {
-		return nil, fmt.Errorf("server: parse key: %q: invalid key", k)
-	}
-	return out, nil
+	return srv
 }
 
 func (s *Server) dispatch(port uint16) func(net.Conn) {
@@ -395,6 +336,12 @@ func (s *Server) dispatch(port uint16) func(net.Conn) {
 	}
 }
 
+func (s *Server) allowClient(k key.NodePublic) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingPairingLocked() != nil || s.sessions[k.String()] != nil
+}
+
 func (s *Server) handleControl(conn net.Conn) {
 	sess, ok := s.handleShake(conn)
 	if !ok {
@@ -405,36 +352,6 @@ func (s *Server) handleControl(conn net.Conn) {
 
 	cause := s.serve(sess)
 	s.endSession(sess, cause)
-}
-
-func (s *Server) serve(sess *session) error {
-	r := deadlineReader{
-		conn:    sess.conn,
-		timeout: s.cfg.LivenessTimeout,
-	}
-	for {
-		f, err := protocol.ReadFrame(r)
-		if err != nil {
-			return timeoutErr(err)
-		}
-
-		if err := s.handleFrame(sess, f); err != nil {
-			return err // Client close, malformed frame
-		}
-	}
-}
-
-func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
-	switch f.Kind {
-	case protocol.KindMsg:
-		return s.handleMsg(sess, f)
-	case protocol.KindClose:
-		return s.handleClose(sess, f)
-	case protocol.KindPing:
-		return s.handlePing(sess, f)
-	default:
-		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
-	}
 }
 
 func (s *Server) handleShake(conn net.Conn) (*session, bool) {
@@ -534,10 +451,81 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 	return sess, true
 }
 
-func (s *Server) allowClient(k key.NodePublic) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pendingPairingLocked() != nil || s.sessions[k.String()] != nil
+func newPIN() (string, error) {
+	pin, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", fmt.Errorf("generate PIN: %w", err)
+	}
+	return fmt.Sprintf("%06d", pin), nil
+}
+
+// nil if none or expired, s.mu must be locked
+func (s *Server) pendingPairingLocked() *pairing {
+	if s.pairing != nil && !s.now().Before(s.pairing.expires) {
+		s.pairing = nil
+	}
+	return s.pairing
+}
+
+// Attempt to redeem pin, s.mu must be locked
+func (s *Server) redeemLocked(pin string) protocol.CloseErr {
+	p := s.pendingPairingLocked()
+	if p == nil {
+		return protocol.CloseErrPairingLocked
+	}
+
+	if subtle.ConstantTimeCompare([]byte(p.pin), []byte(pin)) != 1 {
+		p.failures++
+		s.pairingFailures++
+		if p.failures >= maxFailuresPerPIN || s.pairingFailures >= maxPairingFailures {
+			s.pairing = nil
+		}
+		return protocol.CloseErrWrongPIN
+	}
+	s.pairing = nil
+	return protocol.CloseErrNone
+}
+
+func parseKey(k string) (*key.NodePublic, error) {
+	out := &key.NodePublic{}
+	if err := out.UnmarshalText([]byte(k)); err != nil {
+		return nil, fmt.Errorf("server: parse key: %q: %w", k, err)
+	}
+
+	if out.IsZero() {
+		return nil, fmt.Errorf("server: parse key: %q: invalid key", k)
+	}
+	return out, nil
+}
+
+func (s *Server) serve(sess *session) error {
+	r := deadlineReader{
+		conn:    sess.conn,
+		timeout: s.cfg.LivenessTimeout,
+	}
+	for {
+		f, err := protocol.ReadFrame(r)
+		if err != nil {
+			return timeoutErr(err)
+		}
+
+		if err := s.handleFrame(sess, f); err != nil {
+			return err // Client close, malformed frame
+		}
+	}
+}
+
+func (s *Server) handleFrame(sess *session, f protocol.Frame) error {
+	switch f.Kind {
+	case protocol.KindMsg:
+		return s.handleMsg(sess, f)
+	case protocol.KindClose:
+		return s.handleClose(sess, f)
+	case protocol.KindPing:
+		return s.handlePing(sess, f)
+	default:
+		return fmt.Errorf("unexpected %v frame after handshake", f.Kind)
+	}
 }
 
 func (s *Server) handleMsg(sess *session, f protocol.Frame) error {
@@ -563,12 +551,6 @@ func (s *Server) handlePing(sess *session, f protocol.Frame) error {
 	return nil
 }
 
-type clientCloseError struct{ reason protocol.CloseErr }
-
-func (e clientCloseError) Error() string {
-	return "meshnet: client closed: " + e.reason.String()
-}
-
 func (s *Server) handleClose(sess *session, f protocol.Frame) error {
 	var cl protocol.Close
 	if err := cl.UnmarshalBinary(f.Payload); err != nil {
@@ -578,19 +560,6 @@ func (s *Server) handleClose(sess *session, f protocol.Frame) error {
 	return clientCloseError{reason: cl.Err}
 }
 
-// Convert why a session ended into what an app is told
-// stopped is true when the server was stopping at the time
-func disconnectReason(cause error, stopped bool) error {
-	var ce clientCloseError
-	switch {
-	case stopped:
-		return ErrClosed
-	case errors.As(cause, &ce) && ce.reason == protocol.CloseErrNone:
-		return nil // clean disconnect
-	default:
-		return cause // closed with a reason
-	}
-}
 func (s *Server) handleStream(conn net.Conn) {
 	s.mu.Lock()
 	srv := s.srv
@@ -636,6 +605,38 @@ func (s *Server) handleStream(conn net.Conn) {
 		return
 	}
 	ch <- conn
+}
+
+func (s *Server) dropPendingStream(sess *session, id uint64) {
+	s.mu.Lock()
+	delete(sess.pending, id)
+	s.mu.Unlock()
+}
+
+func enqueueErr(err error) error {
+	if errors.Is(err, transport.ErrFull) {
+		return ErrSendQueueFull
+	}
+
+	if errors.Is(err, transport.ErrClosed) {
+		return ErrNotConnected
+	}
+
+	return err
+}
+
+// Convert why a session ended into what an app is told
+// stopped is true when the server was stopping at the time
+func disconnectReason(cause error, stopped bool) error {
+	var ce clientCloseError
+	switch {
+	case stopped:
+		return ErrClosed
+	case errors.As(cause, &ce) && ce.reason == protocol.CloseErrNone:
+		return nil // clean disconnect
+	default:
+		return cause // closed with a reason
+	}
 }
 
 // returns the connected session for client id, s.mu must be held
