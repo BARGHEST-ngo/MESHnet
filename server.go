@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -312,8 +311,14 @@ func enqueueErr(err error) error {
 }
 
 func (s *Server) Clients() []ClientInfo {
-	// TODO
-	return make([]ClientInfo, 0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]ClientInfo, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		out = append(out, sess.clientInfo)
+	}
+	return out
 }
 
 // DisconnectClient ends the session of the client with this ID and removes the client from the tunnel
@@ -357,22 +362,6 @@ func (s *Server) PairingPIN() string {
 		return p.pin
 	}
 	return ""
-}
-
-func parseAllowedClients(clients []string) ([]key.NodePublic, error) {
-	out := make([]key.NodePublic, 0, len(clients))
-
-	for i, c := range clients {
-		c = strings.TrimSpace(c)
-		k, err := parseKey(c)
-		if err != nil {
-			return nil, fmt.Errorf("allow client [%d]: %w", i, err)
-		}
-
-		out = append(out, *k)
-	}
-
-	return out, nil
 }
 
 func parseKey(k string) (*key.NodePublic, error) {

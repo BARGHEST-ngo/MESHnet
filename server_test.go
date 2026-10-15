@@ -262,58 +262,6 @@ func TestServerStartStop(t *testing.T) {
 	})
 }
 
-func TestServerParseAllowedClients(t *testing.T) {
-	k1 := key.NewNode().Public().String()
-	k2 := key.NewNode().Public().String()
-	k3 := key.NewNode().Public().String()
-	tests := []struct {
-		name    string
-		in      []string
-		wantLen int
-		wantErr bool
-	}{
-		{name: "nil input", in: nil, wantLen: 0, wantErr: false},
-		{name: "empty slice", in: []string{}, wantLen: 0, wantErr: false},
-		{name: "one valid", in: []string{k1}, wantLen: 1, wantErr: false},
-		{name: "several valid", in: []string{k1, k2, k3}, wantLen: 3, wantErr: false},
-		{name: "bad entry", in: []string{"rubbish"}, wantLen: 0, wantErr: true},
-		{name: "mixed entry", in: []string{k1, "rubbish", k2}, wantLen: 0, wantErr: true},
-		{name: "missing prefix", in: []string{strings.TrimPrefix(k1, "nodekey:")}, wantLen: 0, wantErr: true},
-		{name: "whitespace", in: []string{" " + k1 + " "}, wantLen: 1, wantErr: false},
-		{name: "empty key", in: []string{""}, wantLen: 0, wantErr: true},
-		{name: "zero key", in: []string{key.NodePublic{}.String()}, wantLen: 0, wantErr: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseAllowedClients(tc.in)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("expected an error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if tc.wantErr {
-				return
-			}
-
-			if len(got) != tc.wantLen {
-				t.Errorf("expected %d, got %d", tc.wantLen, len(got))
-			}
-
-			for i := range got {
-				if got[i].String() != strings.TrimSpace(tc.in[i]) {
-					t.Errorf("unexpected key found")
-				}
-			}
-		})
-	}
-}
-
 const testClientName = "test"
 
 type addrConn struct {
@@ -1531,4 +1479,35 @@ func TestServerStopDoesNotRevokeKeys(t *testing.T) {
 		t.Fatalf("disconnected with %v, want ErrClosed", ev.err)
 	}
 	none(t, fake.disconnected)
+}
+
+func TestServerListClients(t *testing.T) {
+	t.Run("none connected", func(t *testing.T) {
+		s, _ := newTestServer(t, nil)
+		if len(s.Clients()) != 0 {
+			t.Errorf("expected 0 clients, got %d", len(s.Clients()))
+		}
+	})
+
+	t.Run("single client", func(t *testing.T) {
+		s, fake := newTestServer(t, nil)
+		startPairing(t, s)
+		_, id, _ := connectClient(t, s, fake)
+
+		if len(s.Clients()) != 1 {
+			t.Fatalf("expected 1 client, got %d", len(s.Clients()))
+		}
+
+		if s.Clients()[0].ID != id {
+			t.Errorf("expected id %q, got %q", id, s.Clients()[0].ID)
+		}
+
+		if err := s.DisconnectClient(id); err != nil {
+			t.Fatalf("disconnect client: %v", err)
+		}
+
+		if len(s.Clients()) != 0 {
+			t.Errorf("client still listed after disconnecting")
+		}
+	})
 }
