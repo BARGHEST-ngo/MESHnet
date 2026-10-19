@@ -257,6 +257,8 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	}
 }
 
+// Turns forwarding on or off for the specified clientID, defaults to off
+// Turning it off or a session ending closes the client's forwarded connection
 func (s *Server) SetForwarding(clientID string, on bool) error {
 	if !s.cfg.Forward {
 		return ErrForwardingDisabled
