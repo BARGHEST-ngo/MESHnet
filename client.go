@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -41,7 +42,8 @@ type Client struct {
 }
 
 type tailcatClient interface {
-	DialTCPPort(ctx context.Context, port uint16) (net.Conn, error)
+	DialTCP(ctx context.Context, ap netip.AddrPort) (net.Conn, error) // Through the server, to anywhere
+	DialTCPPort(ctx context.Context, port uint16) (net.Conn, error)   // To the server on this port
 	PublicKey() key.NodePublic
 	Close() error
 }
@@ -166,6 +168,18 @@ func (c *Client) Send(m Message) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	c.mu.Lock()
+	if c.writer == nil {
+		c.mu.Unlock()
+		return nil, ErrNotConnected
+	}
+	tc := c.tc
+	c.mu.Unlock()
+
+	return tc.DialTCP(ctx, dst)
 }
 
 func (c *Client) ID() string {
