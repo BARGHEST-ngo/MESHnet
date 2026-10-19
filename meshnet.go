@@ -22,6 +22,7 @@ var (
 	ErrServerFull           = errors.New("meshnet: maximum clients connected")
 	ErrDisconnectedByServer = errors.New("meshnet: client removed by server")
 	ErrPairingExhausted     = errors.New("meshnet: too many failed pairing attempts, restart the server")
+	ErrForwardingDisabled   = errors.New("meshnet: forwarding is disabled")
 )
 
 func (s State) String() string {

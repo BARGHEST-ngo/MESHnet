@@ -1556,3 +1556,46 @@ func TestServerWrongKeysExhaustPairing(t *testing.T) {
 		t.Fatalf("NewPairing after forged keys: %v, want ErrPairingExhausted", err)
 	}
 }
+
+func TestServerAllowedDestination(t *testing.T) {
+	cases := []struct {
+		addr    netip.AddrPort
+		allowed bool
+	}{
+		{addr: netip.MustParseAddrPort("1.1.1.1:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("[2606:4700:4700::1111]:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("1.1.1.1:0"), allowed: false},
+		{addr: netip.AddrPort{}, allowed: false},
+		// loopback
+		{addr: netip.MustParseAddrPort("127.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::1]:80"), allowed: false},
+		// private
+		{addr: netip.MustParseAddrPort("10.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("172.16.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("192.168.1.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:80"), allowed: false}, // tailcat-assigned range
+		// link-local, including the cloud metadata address
+		{addr: netip.MustParseAddrPort("169.254.169.254:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[fe80::1]:80"), allowed: false},
+		// CGNAT and "this host"
+		{addr: netip.MustParseAddrPort("100.64.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("0.1.2.3:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("0.0.0.0:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::]:80"), allowed: false},
+		// multicast and broadcast
+		{addr: netip.MustParseAddrPort("224.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[ff02::1]:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("255.255.255.255:80"), allowed: false},
+		// IPv4-mapped IPv6
+		{addr: netip.MustParseAddrPort("[::ffff:1.1.1.1]:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("[::ffff:10.0.0.1]:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::ffff:100.64.0.1]:80"), allowed: false},
+	}
+
+	for _, tc := range cases {
+		got := allowedDestination(tc.addr)
+		if got != tc.allowed {
+			t.Errorf("%v: %v, wanted %v", tc.addr, got, tc.allowed)
+		}
+	}
+}

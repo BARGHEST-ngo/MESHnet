@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -37,6 +38,8 @@ type session struct {
 	pending      map[uint64]chan net.Conn
 	streams      []net.Conn
 	endReason    error
+	forwarding   bool
+	forwarded    map[net.Conn]struct{}
 }
 
 type pairing struct {
@@ -57,6 +60,7 @@ type ServerConfig struct {
 	OnClientConnected    func(c ClientInfo)
 	OnClientDisconnected func(c ClientInfo, e error)
 	LivenessTimeout      time.Duration // Minimum 20s
+	Forward              bool
 }
 
 type Server struct {
@@ -71,6 +75,7 @@ type Server struct {
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
 	now        func() time.Time
+	allowDst   func(netip.AddrPort) bool
 }
 
 type tailcatServer interface {
@@ -111,10 +116,11 @@ func NewServer(cfg ServerConfig) *Server {
 	done := make(chan struct{})
 	close(done)
 	s := &Server{
-		done: done,
-		err:  ErrClosed,
-		cfg:  cfg,
-		now:  time.Now,
+		done:     done,
+		err:      ErrClosed,
+		cfg:      cfg,
+		now:      time.Now,
+		allowDst: allowedDestination,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
@@ -251,6 +257,31 @@ func (s *Server) RequestStream(ctx context.Context, clientID, target string) (ne
 	}
 }
 
+func (s *Server) SetForwarding(clientID string, on bool) error {
+	if !s.cfg.Forward {
+		return ErrForwardingDisabled
+	}
+
+	s.mu.Lock()
+	sess, err := s.sessionForClientLocked(clientID)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+
+	sess.forwarding = on
+	var fwdConns map[net.Conn]struct{}
+	if !sess.forwarding {
+		fwdConns = sess.forwarded
+		sess.forwarded = make(map[net.Conn]struct{})
+	}
+	s.mu.Unlock()
+	for c := range fwdConns {
+		c.Close()
+	}
+	return nil
+}
+
 // DisconnectClient ends the session of the client with this ID and removes the client from the tunnel
 // It returns after the client's slot is freed, NewPairing can be called immediately
 func (s *Server) DisconnectClient(clientID string) error {
@@ -317,10 +348,16 @@ func (s *Server) Err() error {
 }
 
 func (s *Server) buildTailcat() tailcatServer {
+	var fwdTCP func(netip.AddrPort) func(net.Conn)
+	if s.cfg.Forward {
+		fwdTCP = s.forwardTCP
+	}
+
 	srv := &tailcat.Server{
-		OnTCP:       s.dispatch,
-		Logf:        s.cfg.Logf,
-		AllowClient: s.allowClient,
+		OnTCP:        s.dispatch,
+		Logf:         s.cfg.Logf,
+		AllowClient:  s.allowClient,
+		OnTCPForward: fwdTCP,
 	}
 	return srv
 }
@@ -415,8 +452,9 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 				ID:   clientKey.String(),
 				Name: h.Name,
 			},
-			pending: make(map[uint64]chan net.Conn),
-			key:     *clientKey,
+			pending:   make(map[uint64]chan net.Conn),
+			key:       *clientKey,
+			forwarded: make(map[net.Conn]struct{}),
 		}
 		s.sessions[clientKey.String()] = sess
 	}
@@ -607,6 +645,83 @@ func (s *Server) handleStream(conn net.Conn) {
 	ch <- conn
 }
 
+func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+
+	// The session is the one belonging to the key the tunnel authenticated
+	var peer key.NodePublic
+	ok := false
+	if srv != nil {
+		peer, ok = srv.PeerKey(conn.RemoteAddr())
+	}
+	if !ok {
+		conn.Close()
+		return
+	}
+
+	s.mu.Lock()
+	sess, err := s.sessionForClientLocked(peer.String())
+	if err != nil {
+		s.mu.Unlock()
+		s.cfg.Logf("meshnet: forward: %v", err)
+		conn.Close()
+		return
+	}
+
+	if !sess.forwarding {
+		s.mu.Unlock()
+		conn.Close()
+		return
+	}
+	sess.forwarded[conn] = struct{}{}
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(sess.forwarded, conn)
+		s.mu.Unlock()
+	}()
+
+	dialer := net.Dialer{
+		Timeout: 10 * time.Second,
+	}
+	out, err := dialer.Dial("tcp", dst.String())
+	if err != nil {
+		conn.Close()
+		return
+	}
+	tailcat.ProxyConns(conn, out)
+}
+
+func (s *Server) forwardTCP(dst netip.AddrPort) func(net.Conn) {
+	if !s.allowDst(dst) {
+		return nil
+	}
+	return func(conn net.Conn) { s.handleForward(conn, dst) }
+}
+
+var refusedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),     // RFC 1122 "this host"
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT
+}
+
+func allowedDestination(dst netip.AddrPort) bool {
+	addr := dst.Addr().Unmap()
+	if dst.Port() == 0 || !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return false
+	}
+
+	for _, p := range refusedPrefixes {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (s *Server) dropPendingStream(sess *session, id uint64) {
 	s.mu.Lock()
 	delete(sess.pending, id)
@@ -676,13 +791,20 @@ func (s *Server) endSession(sess *session, cause error) {
 	stopped := s.srv == nil
 	streams := sess.streams
 	reason := sess.endReason
+	fwdConns := sess.forwarded
+	sess.forwarded = nil
 	s.mu.Unlock()
 
 	if w != nil {
 		w.Close()
 	}
+
 	for _, stream := range streams {
 		stream.Close()
+	}
+
+	for c := range fwdConns {
+		c.Close()
 	}
 
 	if reason == nil {
