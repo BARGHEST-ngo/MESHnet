@@ -1681,3 +1681,77 @@ func TestServerSetForwardErrors(t *testing.T) {
 		}
 	})
 }
+
+// echoListener accepts connections on loopback and echoes back what it reads
+func echoListener(t *testing.T) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c)
+			}()
+		}
+	}()
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+// forward runs handleForward for a connection from the test client to dst
+func forward(t *testing.T, s *Server, dst netip.AddrPort) (client net.Conn, done <-chan struct{}) {
+	t.Helper()
+	server, client := net.Pipe()
+	finished := make(chan struct{})
+	go func() {
+		s.handleForward(addrConn{server, testClientStreamAddr}, dst)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-finished
+	})
+	return client, finished
+}
+
+func TestServerForward(t *testing.T) {
+	s, fake := startForwardServer(t, true)
+	_, id, _ := connectClient(t, s, fake)
+	if err := s.SetForwarding(id, true); err != nil {
+		t.Fatalf("SetForwarding: %v", err)
+	}
+	s.mu.Lock()
+	sess := s.sessions[id]
+	s.mu.Unlock()
+
+	client, done := forward(t, s, echoListener(t))
+
+	want := []byte("hello through the exit node")
+	if _, err := client.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("echo %q, want %q", got, want)
+	}
+
+	client.Close()
+	assertClosed(t, done)
+
+	s.mu.Lock()
+	n := len(sess.forwarded)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d forwarded conns left after the handler returned, want 0", n)
+	}
+}
