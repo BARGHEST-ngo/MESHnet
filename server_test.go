@@ -1630,14 +1630,20 @@ func TestServerForwardTCPRefusesDestination(t *testing.T) {
 	}
 }
 
+func startForwardServer(t *testing.T, forward bool) (*Server, *fakeTailcat) {
+	t.Helper()
+	s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = forward })
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	s.NewPairing()
+	t.Cleanup(func() { s.Stop() })
+	return s, fake
+}
+
 func TestServerSetForwardErrors(t *testing.T) {
 	t.Run("ServerConfig.Forward not set", func(t *testing.T) {
-		s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = false })
-		_, err := s.Start()
-		if err != nil {
-			t.Fatalf("start: %v", err)
-		}
-		s.NewPairing()
+		s, fake := startForwardServer(t, false)
 		_, id, _ := connectClient(t, s, fake)
 		t.Cleanup(func() { s.Stop() })
 
@@ -1647,12 +1653,7 @@ func TestServerSetForwardErrors(t *testing.T) {
 	})
 
 	t.Run("no connected clients", func(t *testing.T) {
-		s, _ := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
-		_, err := s.Start()
-		if err != nil {
-			t.Fatalf("start: %v", err)
-		}
-		t.Cleanup(func() { s.Stop() })
+		s, _ := startForwardServer(t, true)
 
 		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrNotConnected) {
 			t.Errorf("got %v, want ErrNotConnected", err)
@@ -1660,12 +1661,7 @@ func TestServerSetForwardErrors(t *testing.T) {
 	})
 
 	t.Run("wrong client ID", func(t *testing.T) {
-		s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
-		_, err := s.Start()
-		if err != nil {
-			t.Fatalf("start: %v", err)
-		}
-		s.NewPairing()
+		s, fake := startForwardServer(t, true)
 		connectClient(t, s, fake)
 		t.Cleanup(func() { s.Stop() })
 
@@ -1675,12 +1671,7 @@ func TestServerSetForwardErrors(t *testing.T) {
 	})
 
 	t.Run("set forward after stop", func(t *testing.T) {
-		s, _ := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
-		_, err := s.Start()
-		if err != nil {
-			t.Fatalf("start: %v", err)
-		}
-
+		s, _ := startForwardServer(t, true)
 		if err := s.Stop(); err != nil {
 			t.Fatalf("stop: %v", err)
 		}
