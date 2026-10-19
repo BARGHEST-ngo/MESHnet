@@ -1599,3 +1599,94 @@ func TestServerAllowedDestination(t *testing.T) {
 		}
 	}
 }
+
+func TestServerForwardInstallsHandler(t *testing.T) {
+	if NewServer(ServerConfig{}).buildTailcat().(*tailcat.Server).OnTCPForward != nil {
+		t.Fatalf("OnTCPForward handler installed when it should not")
+	}
+
+	if NewServer(ServerConfig{Forward: true}).buildTailcat().(*tailcat.Server).OnTCPForward == nil {
+		t.Fatalf("OnTCPForward handler not installed when it should")
+	}
+}
+
+func TestServerForwardTCPRefusesDestination(t *testing.T) {
+	cases := []struct {
+		addr netip.AddrPort
+		want bool
+	}{
+		{addr: netip.MustParseAddrPort("127.0.0.1:80"), want: false},
+		{addr: netip.MustParseAddrPort("1.1.1.1:443"), want: true},
+	}
+
+	for _, tc := range cases {
+		s := NewServer(ServerConfig{Forward: true})
+		got := s.forwardTCP(tc.addr)
+		if got == nil && tc.want {
+			t.Errorf("%v: wanted handler, got none", tc.addr)
+		} else if got != nil && !tc.want {
+			t.Errorf("%v: got a handler, want nil", tc.addr)
+		}
+	}
+}
+
+func TestServerSetForwardErrors(t *testing.T) {
+	t.Run("ServerConfig.Forward not set", func(t *testing.T) {
+		s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = false })
+		_, err := s.Start()
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		s.NewPairing()
+		_, id, _ := connectClient(t, s, fake)
+		t.Cleanup(func() { s.Stop() })
+
+		if err := s.SetForwarding(id, true); !errors.Is(err, ErrForwardingDisabled) {
+			t.Errorf("got %v, want ErrForwardingDisabled", err)
+		}
+	})
+
+	t.Run("no connected clients", func(t *testing.T) {
+		s, _ := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
+		_, err := s.Start()
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		t.Cleanup(func() { s.Stop() })
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrNotConnected) {
+			t.Errorf("got %v, want ErrNotConnected", err)
+		}
+	})
+
+	t.Run("wrong client ID", func(t *testing.T) {
+		s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
+		_, err := s.Start()
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		s.NewPairing()
+		connectClient(t, s, fake)
+		t.Cleanup(func() { s.Stop() })
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrUnknownClient) {
+			t.Errorf("got %v, want ErrUnknownClient", err)
+		}
+	})
+
+	t.Run("set forward after stop", func(t *testing.T) {
+		s, _ := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = true })
+		_, err := s.Start()
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		if err := s.Stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrNotConnected) {
+			t.Errorf("got %v, want ErrNotConnected", err)
+		}
+	})
+}
