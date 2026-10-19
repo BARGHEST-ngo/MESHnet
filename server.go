@@ -38,7 +38,6 @@ type session struct {
 	pending      map[uint64]chan net.Conn
 	streams      []net.Conn
 	endReason    error
-	forwarding   bool
 	forwarded    map[net.Conn]struct{}
 }
 
@@ -75,7 +74,6 @@ type Server struct {
 	cfg        ServerConfig
 	newTailcat func() tailcatServer
 	now        func() time.Time
-	allowDst   func(netip.AddrPort) bool
 }
 
 type tailcatServer interface {
@@ -116,11 +114,10 @@ func NewServer(cfg ServerConfig) *Server {
 	done := make(chan struct{})
 	close(done)
 	s := &Server{
-		done:     done,
-		err:      ErrClosed,
-		cfg:      cfg,
-		now:      time.Now,
-		allowDst: allowedDestination,
+		done: done,
+		err:  ErrClosed,
+		cfg:  cfg,
+		now:  time.Now,
 	}
 	s.newTailcat = s.buildTailcat
 	return s
@@ -271,11 +268,13 @@ func (s *Server) SetForwarding(clientID string, on bool) error {
 		return err
 	}
 
-	sess.forwarding = on
 	var fwdConns map[net.Conn]struct{}
-	if !sess.forwarding {
-		fwdConns = sess.forwarded
+	switch {
+	case on && sess.forwarded == nil:
 		sess.forwarded = make(map[net.Conn]struct{})
+	case !on:
+		fwdConns = sess.forwarded
+		sess.forwarded = nil
 	}
 	s.mu.Unlock()
 	for c := range fwdConns {
@@ -672,7 +671,7 @@ func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
 		return
 	}
 
-	if !sess.forwarding {
+	if sess.forwarded == nil {
 		s.mu.Unlock()
 		conn.Close()
 		return
@@ -698,7 +697,7 @@ func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
 }
 
 func (s *Server) forwardTCP(dst netip.AddrPort) func(net.Conn) {
-	if !s.allowDst(dst) {
+	if !allowedDestination(dst) {
 		return nil
 	}
 	return func(conn net.Conn) { s.handleForward(conn, dst) }
