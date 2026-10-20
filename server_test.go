@@ -1556,3 +1556,246 @@ func TestServerWrongKeysExhaustPairing(t *testing.T) {
 		t.Fatalf("NewPairing after forged keys: %v, want ErrPairingExhausted", err)
 	}
 }
+
+func TestServerAllowedDestination(t *testing.T) {
+	cases := []struct {
+		addr    netip.AddrPort
+		allowed bool
+	}{
+		{addr: netip.MustParseAddrPort("1.1.1.1:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("[2606:4700:4700::1111]:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("1.1.1.1:0"), allowed: false},
+		{addr: netip.AddrPort{}, allowed: false},
+		// loopback
+		{addr: netip.MustParseAddrPort("127.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::1]:80"), allowed: false},
+		// private
+		{addr: netip.MustParseAddrPort("10.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("172.16.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("192.168.1.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:80"), allowed: false}, // tailcat-assigned range
+		// link-local, including the cloud metadata address
+		{addr: netip.MustParseAddrPort("169.254.169.254:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[fe80::1]:80"), allowed: false},
+		// CGNAT and "this host"
+		{addr: netip.MustParseAddrPort("100.64.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("0.1.2.3:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("0.0.0.0:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::]:80"), allowed: false},
+		// multicast and broadcast
+		{addr: netip.MustParseAddrPort("224.0.0.1:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[ff02::1]:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("255.255.255.255:80"), allowed: false},
+		// IPv4-mapped IPv6
+		{addr: netip.MustParseAddrPort("[::ffff:1.1.1.1]:443"), allowed: true},
+		{addr: netip.MustParseAddrPort("[::ffff:10.0.0.1]:80"), allowed: false},
+		{addr: netip.MustParseAddrPort("[::ffff:100.64.0.1]:80"), allowed: false},
+	}
+
+	for _, tc := range cases {
+		got := allowedDestination(tc.addr)
+		if got != tc.allowed {
+			t.Errorf("%v: %v, wanted %v", tc.addr, got, tc.allowed)
+		}
+	}
+}
+
+func TestServerForwardInstallsHandler(t *testing.T) {
+	if NewServer(ServerConfig{}).buildTailcat().(*tailcat.Server).OnTCPForward != nil {
+		t.Fatalf("OnTCPForward handler installed when it should not")
+	}
+
+	if NewServer(ServerConfig{Forward: true}).buildTailcat().(*tailcat.Server).OnTCPForward == nil {
+		t.Fatalf("OnTCPForward handler not installed when it should")
+	}
+}
+
+func TestServerForwardTCPRefusesDestination(t *testing.T) {
+	cases := []struct {
+		addr netip.AddrPort
+		want bool
+	}{
+		{addr: netip.MustParseAddrPort("127.0.0.1:80"), want: false},
+		{addr: netip.MustParseAddrPort("1.1.1.1:443"), want: true},
+	}
+
+	for _, tc := range cases {
+		s := NewServer(ServerConfig{Forward: true})
+		got := s.forwardTCP(tc.addr)
+		if got == nil && tc.want {
+			t.Errorf("%v: wanted handler, got none", tc.addr)
+		} else if got != nil && !tc.want {
+			t.Errorf("%v: got a handler, want nil", tc.addr)
+		}
+	}
+}
+
+func startForwardServer(t *testing.T, forward bool) (*Server, *fakeTailcat) {
+	t.Helper()
+	s, fake := newTestServer(t, func(cfg *ServerConfig) { cfg.Forward = forward })
+	if _, err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	s.NewPairing()
+	t.Cleanup(func() { s.Stop() })
+	return s, fake
+}
+
+func TestServerSetForwardErrors(t *testing.T) {
+	t.Run("ServerConfig.Forward not set", func(t *testing.T) {
+		s, fake := startForwardServer(t, false)
+		_, id, _ := connectClient(t, s, fake)
+		t.Cleanup(func() { s.Stop() })
+
+		if err := s.SetForwarding(id, true); !errors.Is(err, ErrForwardingDisabled) {
+			t.Errorf("got %v, want ErrForwardingDisabled", err)
+		}
+	})
+
+	t.Run("no connected clients", func(t *testing.T) {
+		s, _ := startForwardServer(t, true)
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrNotConnected) {
+			t.Errorf("got %v, want ErrNotConnected", err)
+		}
+	})
+
+	t.Run("wrong client ID", func(t *testing.T) {
+		s, fake := startForwardServer(t, true)
+		connectClient(t, s, fake)
+		t.Cleanup(func() { s.Stop() })
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrUnknownClient) {
+			t.Errorf("got %v, want ErrUnknownClient", err)
+		}
+	})
+
+	t.Run("set forward after stop", func(t *testing.T) {
+		s, _ := startForwardServer(t, true)
+		if err := s.Stop(); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+
+		if err := s.SetForwarding("some-client-id", true); !errors.Is(err, ErrNotConnected) {
+			t.Errorf("got %v, want ErrNotConnected", err)
+		}
+	})
+}
+
+// echoListener accepts connections on loopback and echoes back what it reads
+func echoListener(t *testing.T) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c)
+			}()
+		}
+	}()
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+// forward runs handleForward for a connection from the test client to dst
+func forward(t *testing.T, s *Server, dst netip.AddrPort) (client net.Conn, done <-chan struct{}) {
+	t.Helper()
+	server, client := net.Pipe()
+	finished := make(chan struct{})
+	go func() {
+		s.handleForward(addrConn{server, testClientStreamAddr}, dst)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-finished
+	})
+	return client, finished
+}
+
+// forwardingClient starts a forwarding server with one connected client that has forwarding enabled
+func forwardingClient(t *testing.T) (s *Server, id string) {
+	t.Helper()
+	s, fake := startForwardServer(t, true)
+	_, id, _ = connectClient(t, s, fake)
+	if err := s.SetForwarding(id, true); err != nil {
+		t.Fatalf("SetForwarding: %v", err)
+	}
+	return s, id
+}
+
+func echoOnce(t *testing.T, conn net.Conn) {
+	t.Helper()
+	want := []byte("hello through the exit node")
+	if _, err := conn.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("echo %q, want %q", got, want)
+	}
+}
+
+// wantClosed checks the server closed the forwarded conn and its handler returned
+func wantClosed(t *testing.T, client net.Conn, done <-chan struct{}) {
+	t.Helper()
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF", err)
+	}
+	assertClosed(t, done)
+}
+
+func TestServerForward(t *testing.T) {
+	s, id := forwardingClient(t)
+	s.mu.Lock()
+	sess := s.sessions[id]
+	s.mu.Unlock()
+
+	client, done := forward(t, s, echoListener(t))
+	echoOnce(t, client)
+	client.Close()
+	assertClosed(t, done)
+
+	s.mu.Lock()
+	n := len(sess.forwarded)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d forwarded conns left after the handler returned, want 0", n)
+	}
+}
+
+func TestServerForwardingEnds(t *testing.T) {
+	cases := map[string]func(s *Server, id string) error{
+		"switched off": func(s *Server, id string) error { return s.SetForwarding(id, false) },
+		"session ends": (*Server).DisconnectClient,
+	}
+
+	for name, end := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, id := forwardingClient(t)
+			dst := echoListener(t)
+			client, done := forward(t, s, dst)
+			echoOnce(t, client)
+
+			if err := end(s, id); err != nil {
+				t.Fatalf("end: %v", err)
+			}
+			wantClosed(t, client, done)
+
+			client, done = forward(t, s, dst) // new forwards are refused
+			wantClosed(t, client, done)
+		})
+	}
+}
