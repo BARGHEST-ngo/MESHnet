@@ -1721,30 +1721,50 @@ func forward(t *testing.T, s *Server, dst netip.AddrPort) (client net.Conn, done
 	return client, finished
 }
 
-func TestServerForward(t *testing.T) {
+// forwardingClient starts a forwarding server with one connected client that has forwarding enabled
+func forwardingClient(t *testing.T) (s *Server, id string) {
+	t.Helper()
 	s, fake := startForwardServer(t, true)
-	_, id, _ := connectClient(t, s, fake)
+	_, id, _ = connectClient(t, s, fake)
 	if err := s.SetForwarding(id, true); err != nil {
 		t.Fatalf("SetForwarding: %v", err)
 	}
-	s.mu.Lock()
-	sess := s.sessions[id]
-	s.mu.Unlock()
+	return s, id
+}
 
-	client, done := forward(t, s, echoListener(t))
-
+func echoOnce(t *testing.T, conn net.Conn) {
+	t.Helper()
 	want := []byte("hello through the exit node")
-	if _, err := client.Write(want); err != nil {
+	if _, err := conn.Write(want); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	got := make([]byte, len(want))
-	if _, err := io.ReadFull(client, got); err != nil {
+	if _, err := io.ReadFull(conn, got); err != nil {
 		t.Fatalf("read echo: %v", err)
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("echo %q, want %q", got, want)
 	}
+}
 
+// wantClosed checks the server closed the forwarded conn and its handler returned
+func wantClosed(t *testing.T, client net.Conn, done <-chan struct{}) {
+	t.Helper()
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read: %v, want EOF", err)
+	}
+	assertClosed(t, done)
+}
+
+func TestServerForward(t *testing.T) {
+	s, id := forwardingClient(t)
+	s.mu.Lock()
+	sess := s.sessions[id]
+	s.mu.Unlock()
+
+	client, done := forward(t, s, echoListener(t))
+	echoOnce(t, client)
 	client.Close()
 	assertClosed(t, done)
 
@@ -1753,5 +1773,29 @@ func TestServerForward(t *testing.T) {
 	s.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d forwarded conns left after the handler returned, want 0", n)
+	}
+}
+
+func TestServerForwardingEnds(t *testing.T) {
+	cases := map[string]func(s *Server, id string) error{
+		"switched off": func(s *Server, id string) error { return s.SetForwarding(id, false) },
+		"session ends": (*Server).DisconnectClient,
+	}
+
+	for name, end := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, id := forwardingClient(t)
+			dst := echoListener(t)
+			client, done := forward(t, s, dst)
+			echoOnce(t, client)
+
+			if err := end(s, id); err != nil {
+				t.Fatalf("end: %v", err)
+			}
+			wantClosed(t, client, done)
+
+			client, done = forward(t, s, dst) // new forwards are refused
+			wantClosed(t, client, done)
+		})
 	}
 }
