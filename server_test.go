@@ -275,6 +275,7 @@ var (
 	testClientAddr       = tcpAddr("[fd7a:115c:a1e0::1]:40000")
 	testClientStreamAddr = tcpAddr("[fd7a:115c:a1e0::1]:40001")
 	testOtherHostAddr    = tcpAddr("[fd7a:115c:a1e0::99]:40001")
+	testClientUDPAddr    = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:40002"))
 )
 
 // Run handleControl on one end of the pipe and perform handshake from the other side (as the client would)
@@ -1605,8 +1606,16 @@ func TestServerForwardInstallsHandler(t *testing.T) {
 		t.Fatalf("OnTCPForward handler installed when it should not")
 	}
 
+	if NewServer(ServerConfig{}).buildTailcat().(*tailcat.Server).OnUDPForward != nil {
+		t.Fatalf("OnUDPForward handler installed when it should not")
+	}
+
 	if NewServer(ServerConfig{Forward: true}).buildTailcat().(*tailcat.Server).OnTCPForward == nil {
 		t.Fatalf("OnTCPForward handler not installed when it should")
+	}
+
+	if NewServer(ServerConfig{Forward: true}).buildTailcat().(*tailcat.Server).OnUDPForward == nil {
+		t.Fatalf("OnUDPForward handler not installed when it should")
 	}
 }
 
@@ -1796,6 +1805,134 @@ func TestServerForwardingEnds(t *testing.T) {
 
 			client, done = forward(t, s, dst) // new forwards are refused
 			wantClosed(t, client, done)
+		})
+	}
+}
+
+// udpAddrConn is a UDP socket that reports remote as its RemoteAddr, like tailcat's forwarded flows
+type udpAddrConn struct {
+	*net.UDPConn
+	remote net.Addr
+}
+
+func (c udpAddrConn) RemoteAddr() net.Addr { return c.remote }
+
+type udpPeer struct {
+	*net.UDPConn
+	to *net.UDPAddr
+}
+
+func (p udpPeer) Write(b []byte) (int, error) { return p.WriteToUDP(b, p.to) }
+
+func listenUDP(t *testing.T) *net.UDPConn {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	return c
+}
+
+// udpEchoListener echoes back to sender
+func udpEchoListener(t *testing.T) netip.AddrPort {
+	t.Helper()
+	ln := listenUDP(t)
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := ln.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			ln.WriteToUDP(buf[:n], src)
+		}
+	}()
+	return ln.LocalAddr().(*net.UDPAddr).AddrPort()
+}
+
+// forwardUDP runs handleForwardUDP from the test client to dst
+// done is closed when the handler returns
+func forwardUDP(t *testing.T, s *Server, dst netip.AddrPort) (net.Conn, net.Conn, <-chan struct{}) {
+	t.Helper()
+	peer := listenUDP(t)
+	server, err := net.DialUDP("udp", nil, peer.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial udp: %v", err)
+	}
+	client := udpPeer{peer, server.LocalAddr().(*net.UDPAddr)}
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+
+	finished := make(chan struct{})
+	go func() {
+		s.handleForwardUDP(udpAddrConn{server, testClientUDPAddr}, dst)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		server.Close() // UDP has no close signal, so end from the server's side
+		peer.Close()
+		<-finished
+	})
+	return client, server, finished
+}
+
+func TestServerForwardUDPRefusesDestination(t *testing.T) {
+	cases := []struct {
+		addr netip.AddrPort
+		want bool
+	}{
+		{addr: netip.MustParseAddrPort("127.0.0.1:53"), want: false},
+		{addr: netip.MustParseAddrPort("1.1.1.1:53"), want: true},
+	}
+
+	for _, tc := range cases {
+		s := NewServer(ServerConfig{Forward: true})
+		if got := s.forwardUDP(tc.addr); (got != nil) != tc.want {
+			t.Errorf("%v: got handler %v, want %v", tc.addr, got != nil, tc.want)
+		}
+	}
+}
+
+func TestServerForwardUDP(t *testing.T) {
+	s, id := forwardingClient(t)
+	s.mu.Lock()
+	sess := s.sessions[id]
+	s.mu.Unlock()
+
+	client, flow, done := forwardUDP(t, s, udpEchoListener(t))
+	echoOnce(t, client)
+
+	flow.Close()
+	assertClosed(t, done)
+
+	s.mu.Lock()
+	n := len(sess.forwarded)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d forwarded flows left after the handler returned, want 0", n)
+	}
+}
+
+func TestServerForwardingEndsUDP(t *testing.T) {
+	cases := map[string]func(s *Server, id string) error{
+		"switched off": func(s *Server, id string) error { return s.SetForwarding(id, false) },
+		"session ends": (*Server).DisconnectClient,
+	}
+
+	for name, end := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, id := forwardingClient(t)
+			dst := udpEchoListener(t)
+			client, _, done := forwardUDP(t, s, dst)
+			echoOnce(t, client)
+
+			if err := end(s, id); err != nil {
+				t.Fatalf("end: %v", err)
+			}
+			assertClosed(t, done)
+
+			_, _, done = forwardUDP(t, s, dst) // new flows are refused
+			assertClosed(t, done)
 		})
 	}
 }
