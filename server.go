@@ -646,20 +646,19 @@ func (s *Server) handleStream(conn net.Conn) {
 	ch <- conn
 }
 
-func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
+func (s *Server) admitForward(conn net.Conn) (done func(), ok bool) {
 	s.mu.Lock()
 	srv := s.srv
 	s.mu.Unlock()
 
 	// The session is the one belonging to the key the tunnel authenticated
 	var peer key.NodePublic
-	ok := false
 	if srv != nil {
 		peer, ok = srv.PeerKey(conn.RemoteAddr())
 	}
 	if !ok {
 		conn.Close()
-		return
+		return nil, false
 	}
 
 	s.mu.Lock()
@@ -668,22 +667,30 @@ func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
 		s.mu.Unlock()
 		s.cfg.Logf("meshnet: forward: %v", err)
 		conn.Close()
-		return
+		return nil, false
 	}
 
 	if sess.forwarded == nil {
 		s.mu.Unlock()
 		conn.Close()
-		return
+		return nil, false
 	}
 	sess.forwarded[conn] = struct{}{}
 	s.mu.Unlock()
 
-	defer func() {
+	return func() {
 		s.mu.Lock()
 		delete(sess.forwarded, conn)
 		s.mu.Unlock()
-	}()
+	}, true
+}
+
+func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
+	done, ok := s.admitForward(conn)
+	if !ok {
+		return
+	}
+	defer done()
 
 	dialer := net.Dialer{
 		Timeout: 10 * time.Second,
