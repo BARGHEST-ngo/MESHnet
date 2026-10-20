@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
@@ -31,7 +32,9 @@ type Stream interface {
 const connectTimeout = 30 * time.Second
 
 type Client struct {
-	c *meshnet.Client
+	c   *meshnet.Client
+	mu  sync.Mutex
+	fwd *forwarder
 }
 
 func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.ClientConfig {
