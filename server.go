@@ -453,9 +453,8 @@ func (s *Server) handleShake(conn net.Conn) (*session, bool) {
 				ID:   clientKey.String(),
 				Name: h.Name,
 			},
-			pending:   make(map[uint64]chan net.Conn),
-			key:       *clientKey,
-			forwarded: make(map[net.Conn]struct{}),
+			pending: make(map[uint64]chan net.Conn),
+			key:     *clientKey,
 		}
 		s.sessions[clientKey.String()] = sess
 	}
