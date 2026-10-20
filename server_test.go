@@ -1711,7 +1711,7 @@ func forward(t *testing.T, s *Server, dst netip.AddrPort) (client net.Conn, done
 	server, client := net.Pipe()
 	finished := make(chan struct{})
 	go func() {
-		s.handleForward(addrConn{server, testClientStreamAddr}, dst)
+		s.handleForwardTCP(addrConn{server, testClientStreamAddr}, dst)
 		close(finished)
 	}()
 	t.Cleanup(func() {

@@ -688,7 +688,7 @@ func (s *Server) admitForward(conn net.Conn) (done func(), ok bool) {
 	}, true
 }
 
-func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
+func (s *Server) handleForwardTCP(conn net.Conn, dst netip.AddrPort) {
 	done, ok := s.admitForward(conn)
 	if !ok {
 		return
@@ -726,7 +726,7 @@ func (s *Server) forwardTCP(dst netip.AddrPort) func(net.Conn) {
 	if !allowedDestination(dst) {
 		return nil
 	}
-	return func(conn net.Conn) { s.handleForward(conn, dst) }
+	return func(conn net.Conn) { s.handleForwardTCP(conn, dst) }
 }
 
 func (s *Server) forwardUDP(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
