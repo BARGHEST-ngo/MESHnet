@@ -350,8 +350,10 @@ func (s *Server) Err() error {
 
 func (s *Server) buildTailcat() tailcatServer {
 	var fwdTCP func(netip.AddrPort) func(net.Conn)
+	var fwdUDP func(netip.AddrPort) func(tailcat.ConnPacketConn)
 	if s.cfg.Forward {
 		fwdTCP = s.forwardTCP
+		fwdUDP = s.forwardUDP
 	}
 
 	srv := &tailcat.Server{
@@ -359,6 +361,7 @@ func (s *Server) buildTailcat() tailcatServer {
 		Logf:         s.cfg.Logf,
 		AllowClient:  s.allowClient,
 		OnTCPForward: fwdTCP,
+		OnUDPForward: fwdUDP,
 	}
 	return srv
 }
@@ -703,11 +706,35 @@ func (s *Server) handleForward(conn net.Conn, dst netip.AddrPort) {
 	tailcat.ProxyConns(conn, out)
 }
 
+func (s *Server) handleForwardUDP(conn tailcat.ConnPacketConn, dst netip.AddrPort) {
+	done, ok := s.admitForward(conn)
+	if !ok {
+		return
+	}
+	defer done()
+
+	out, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	tailcat.ProxyPacketConns(conn, out)
+}
+
 func (s *Server) forwardTCP(dst netip.AddrPort) func(net.Conn) {
 	if !allowedDestination(dst) {
 		return nil
 	}
 	return func(conn net.Conn) { s.handleForward(conn, dst) }
+}
+
+func (s *Server) forwardUDP(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+	if !allowedDestination(dst) {
+		return nil
+	}
+
+	return func(conn tailcat.ConnPacketConn) { s.handleForwardUDP(conn, dst) }
 }
 
 var refusedPrefixes = []netip.Prefix{
