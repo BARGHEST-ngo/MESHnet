@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,12 @@ import (
 	"tailscale.com/types/key"
 )
 
+// tcpDial is one DialTCP call: where it was for and the destination's end of the pipe
+type tcpDial struct {
+	dst  netip.AddrPort
+	conn net.Conn
+}
+
 type fakeTailcatClient struct {
 	key           key.NodePublic
 	conn          net.Conn
@@ -24,6 +31,8 @@ type fakeTailcatClient struct {
 	streams       chan net.Conn
 	streamDialErr error
 	onStreamDial  func()
+	tcpDials      chan tcpDial
+	tcpDialErr    error
 }
 
 func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Conn, error) {
@@ -42,6 +51,15 @@ func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Con
 		return nil, f.dialErr
 	}
 	return f.conn, nil
+}
+
+func (f *fakeTailcatClient) DialTCP(_ context.Context, dst netip.AddrPort) (net.Conn, error) {
+	if f.tcpDialErr != nil {
+		return nil, f.tcpDialErr
+	}
+	s, c := net.Pipe()
+	f.tcpDials <- tcpDial{dst, s}
+	return c, nil
 }
 
 func (f *fakeTailcatClient) PublicKey() key.NodePublic {
@@ -83,9 +101,10 @@ func fakeConnect(t *testing.T, setup func(cfg *ClientConfig)) (c *Client, fake *
 	}
 
 	fake = &fakeTailcatClient{
-		key:     key.NewNode().Public(),
-		conn:    clientEnd,
-		streams: make(chan net.Conn, 8),
+		key:      key.NewNode().Public(),
+		conn:     clientEnd,
+		streams:  make(chan net.Conn, 8),
+		tcpDials: make(chan tcpDial, 8),
 	}
 	c = NewClient(*cfg)
 	c.newTailcat = func(ClientConfig) tailcatClient { return fake }
@@ -811,4 +830,86 @@ func TestClientStreamOpenedAfterSessionEnds(t *testing.T) {
 		t.Fatalf("read after the ID: %v, want EOF", err)
 	}
 	none(t, calls)
+}
+
+const testDialTCPDst = "203.0.113.7:443" // RFC 7573 TEST-NET-3
+
+func TestClientDialTCPNotConnected(t *testing.T) {
+	dst := netip.MustParseAddrPort(testDialTCPDst)
+
+	t.Run("before Connect", func(t *testing.T) {
+		c := NewClient(ClientConfig{})
+		if _, err := c.DialTCP(context.Background(), dst); !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("err = %v, want ErrNotConnected", err)
+		}
+	})
+
+	t.Run("after Disconnect", func(t *testing.T) {
+		c, fake, _, _ := connected(t, nil)
+		c.Disconnect()
+		if _, err := c.DialTCP(context.Background(), dst); !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("err = %v, want ErrNotConnected", err)
+		}
+		if len(fake.tcpDials) != 0 {
+			t.Fatal("dial reached tailcat after Disconnect")
+		}
+	})
+}
+
+func TestClientDialTCPError(t *testing.T) {
+	c, fake, _, _ := connected(t, nil)
+	want := errors.New("connection refused")
+	fake.tcpDialErr = want
+
+	dst := netip.MustParseAddrPort(testDialTCPDst)
+	if _, err := c.DialTCP(context.Background(), dst); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+func TestClientDialTCP(t *testing.T) {
+	c, fake, _, _ := connected(t, nil)
+	dst := netip.MustParseAddrPort(testDialTCPDst)
+
+	conn, err := c.DialTCP(context.Background(), dst)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	dial := next(t, fake.tcpDials)
+	t.Cleanup(func() { dial.conn.Close() })
+	if dial.dst != dst {
+		t.Fatalf("dialled %v, want %v", dial.dst, dst)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	conn.SetDeadline(deadline)
+	dial.conn.SetDeadline(deadline)
+
+	for _, direction := range []struct {
+		name     string
+		from, to net.Conn
+	}{
+		{name: "client to destination", from: conn, to: dial.conn},
+		{name: "destination to client", from: dial.conn, to: conn},
+	} {
+		want := []byte(direction.name)
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := direction.from.Write(want)
+			wrote <- err
+		}()
+
+		got := make([]byte, len(want))
+		if _, err := io.ReadFull(direction.to, got); err != nil {
+			t.Fatalf("%s: read: %v", direction.name, err)
+		}
+		if err := <-wrote; err != nil {
+			t.Fatalf("%s: write: %v", direction.name, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: got %q, want %q", direction.name, got, want)
+		}
+	}
 }
