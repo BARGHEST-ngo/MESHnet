@@ -19,7 +19,8 @@ import (
 
 // First run `go run ./examples/server`
 // Copy the address and pin output
-// `go run ./examples/client -addr '<addr>' -pin <pin> [-v]`
+// `go run ./examples/client --addr '<addr>' --pin <pin> [--dns <hostname>] [--myip] [-v]`
+// --dns and --myip require the server to be started with -f
 func main() {
 	verbose := flag.Bool("v", false, "verbose logging (MESHnet and tailcat)")
 	addr := flag.String("addr", "", "server address")
