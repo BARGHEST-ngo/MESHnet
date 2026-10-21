@@ -94,7 +94,8 @@ func newForwarder(fd int, mtu uint32, d dialer) (*forwarder, error) {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 
-	if err := s.CreateNIC(1, ep); err != nil {
+	// Create disabled
+	if err := s.CreateNICWithOptions(1, ep, stack.NICOptions{Disabled: true}); err != nil {
 		tunFile.Close()
 		s.Close()
 		return nil, fmt.Errorf("meshnetmobile: createNIC: %v", err)
@@ -131,6 +132,11 @@ func newForwarder(fd int, mtu uint32, d dialer) (*forwarder, error) {
 
 	udpFwd := udp.NewForwarder(s, f.handleUDP)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+
+	// Now start reading packets
+	if err := s.EnableNIC(1); err != nil {
+		return nil, fmt.Errorf("meshnetmobile: enableNIC: %v", err)
+	}
 	return f, nil
 }
 
