@@ -59,7 +59,17 @@ func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.Clien
 }
 
 func NewClient(serverAddr, pairingPIN, name string, l Listener) *Client {
-	return &Client{c: meshnet.NewClient(clientConfig(serverAddr, pairingPIN, name, l))}
+	mobileClient := &Client{}
+	cfg := clientConfig(serverAddr, pairingPIN, name, l)
+	appState := cfg.OnStateChange
+	cfg.OnStateChange = func(s meshnet.State, e error) {
+		if s == meshnet.StateDisconnected || s == meshnet.StateErrored {
+			mobileClient.StopForwarding()
+		}
+		appState(s, e)
+	}
+	mobileClient.c = meshnet.NewClient(cfg)
+	return mobileClient
 }
 
 func (c *Client) Connect() error {

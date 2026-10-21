@@ -30,7 +30,10 @@ var (
 	errAlreadyForwarding = errors.New("meshnetmobile: already forwarding")
 )
 
-const forwardMTU = 1280
+const (
+	forwardMTU     = 1280
+	udpIdleTimeout = 60 * time.Second
+)
 
 type forwarder struct {
 	dialer dialer
@@ -42,6 +45,31 @@ type forwarder struct {
 	mu     sync.Mutex
 	conns  map[io.Closer]struct{} // live flows, both sides
 	closed bool
+}
+
+type idleConn struct {
+	meshnet.PacketConn
+	timeout time.Duration
+}
+
+func (c idleConn) Read(b []byte) (int, error) {
+	c.SetDeadline(time.Now().Add(c.timeout))
+	return c.PacketConn.Read(b)
+}
+
+func (c idleConn) Write(b []byte) (int, error) {
+	c.SetDeadline(time.Now().Add(c.timeout))
+	return c.PacketConn.Write(b)
+}
+
+// dropOversize drops datagrams too big for the tunnel instead of failing the flow
+type dropOversize struct{ meshnet.PacketConn }
+
+func (c dropOversize) Write(b []byte) (int, error) {
+	if len(b) > tailcat.MaxUDPPayload {
+		return len(b), nil
+	}
+	return c.PacketConn.Write(b)
 }
 
 type dialer interface {
@@ -163,7 +191,7 @@ func (f *forwarder) proxyUDP(in *gonet.UDPConn, dst netip.AddrPort) {
 		in.Close()
 		return
 	}
-	tailcat.ProxyPacketConns(in, out)
+	tailcat.ProxyPacketConns(idleConn{in, udpIdleTimeout}, dropOversize{out})
 }
 
 // addrFrom converts a gVisor address, with IPv4 unmapped
@@ -201,6 +229,7 @@ func (f *forwarder) stop() {
 	for c := range conns {
 		c.Close()
 	}
+	f.stack.RemoveNIC(1) // stop the fd reader and wait for it
 	f.stack.Close()
 	f.tun.Close()
 }
