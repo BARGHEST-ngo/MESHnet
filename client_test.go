@@ -14,6 +14,7 @@ import (
 
 	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
 	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
+	"github.com/tailscale/tailcat"
 	"tailscale.com/types/key"
 )
 
@@ -21,6 +22,11 @@ import (
 type tcpDial struct {
 	dst  netip.AddrPort
 	conn net.Conn
+}
+
+type udpDial struct {
+	dst  netip.AddrPort
+	conn *net.UDPConn
 }
 
 type fakeTailcatClient struct {
@@ -33,6 +39,8 @@ type fakeTailcatClient struct {
 	onStreamDial  func()
 	tcpDials      chan tcpDial
 	tcpDialErr    error
+	udpDials      chan udpDial
+	udpDialErr    error
 }
 
 func (f *fakeTailcatClient) DialTCPPort(_ context.Context, port uint16) (net.Conn, error) {
@@ -60,6 +68,23 @@ func (f *fakeTailcatClient) DialTCP(_ context.Context, dst netip.AddrPort) (net.
 	s, c := net.Pipe()
 	f.tcpDials <- tcpDial{dst, s}
 	return c, nil
+}
+
+func (f *fakeTailcatClient) DialUDP(_ context.Context, dst netip.AddrPort) (tailcat.ConnPacketConn, error) {
+	if f.udpDialErr != nil {
+		return nil, f.udpDialErr
+	}
+	far, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, err
+	}
+	near, err := net.DialUDP("udp", nil, far.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		far.Close()
+		return nil, err
+	}
+	f.udpDials <- udpDial{dst, far}
+	return near, nil
 }
 
 func (f *fakeTailcatClient) PublicKey() key.NodePublic {
@@ -105,6 +130,7 @@ func fakeConnect(t *testing.T, setup func(cfg *ClientConfig)) (c *Client, fake *
 		conn:     clientEnd,
 		streams:  make(chan net.Conn, 8),
 		tcpDials: make(chan tcpDial, 8),
+		udpDials: make(chan udpDial, 8),
 	}
 	c = NewClient(*cfg)
 	c.newTailcat = func(ClientConfig) tailcatClient { return fake }
@@ -911,5 +937,82 @@ func TestClientDialTCP(t *testing.T) {
 		if !bytes.Equal(got, want) {
 			t.Fatalf("%s: got %q, want %q", direction.name, got, want)
 		}
+	}
+}
+
+func TestClientDialUDPNotConnected(t *testing.T) {
+	dst := netip.MustParseAddrPort("203.0.113.7:53")
+
+	t.Run("before Connect", func(t *testing.T) {
+		c := NewClient(ClientConfig{})
+		if _, err := c.DialUDP(context.Background(), dst); !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("err = %v, want ErrNotConnected", err)
+		}
+	})
+	t.Run("after Disconnect", func(t *testing.T) {
+		c, fake, _, _ := connected(t, nil)
+		c.Disconnect()
+		if _, err := c.DialUDP(context.Background(), dst); !errors.Is(err, ErrNotConnected) {
+			t.Fatalf("err = %v, want ErrNotConnected", err)
+		}
+		if len(fake.udpDials) != 0 {
+			t.Fatal("dial reached tailcat after Disconnect")
+		}
+	})
+}
+
+func TestClientDialUDPError(t *testing.T) {
+	c, fake, _, _ := connected(t, nil)
+	want := errors.New("no route")
+	fake.udpDialErr = want
+
+	if _, err := c.DialUDP(context.Background(), netip.MustParseAddrPort("203.0.113.7:53")); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+func TestClientDialUDP(t *testing.T) {
+	c, fake, _, _ := connected(t, nil)
+	dst := netip.MustParseAddrPort("203.0.113.7:53")
+
+	conn, err := c.DialUDP(context.Background(), dst)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	d := next(t, fake.udpDials)
+	t.Cleanup(func() { d.conn.Close() })
+	if d.dst != dst {
+		t.Fatalf("dialled %v, want %v", d.dst, dst)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	conn.SetDeadline(deadline)
+	d.conn.SetDeadline(deadline)
+	buf := make([]byte, 64)
+
+	query := []byte("client to destination")
+	if _, err := conn.Write(query); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	n, from, err := d.conn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("destination read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], query) {
+		t.Fatalf("destination got %q, want %q", buf[:n], query)
+	}
+
+	reply := []byte("destination to client")
+	if _, err := d.conn.WriteToUDP(reply, from); err != nil {
+		t.Fatalf("destination write: %v", err)
+	}
+	n, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(buf[:n], reply) {
+		t.Fatalf("client got %q, want %q", buf[:n], reply)
 	}
 }

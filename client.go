@@ -44,6 +44,7 @@ type Client struct {
 type tailcatClient interface {
 	DialTCP(ctx context.Context, ap netip.AddrPort) (net.Conn, error) // Through the server, to anywhere
 	DialTCPPort(ctx context.Context, port uint16) (net.Conn, error)   // To the server on this port
+	DialUDP(ctx context.Context, dst netip.AddrPort) (tailcat.ConnPacketConn, error)
 	PublicKey() key.NodePublic
 	Close() error
 }
@@ -180,6 +181,19 @@ func (c *Client) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, err
 	c.mu.Unlock()
 
 	return tc.DialTCP(ctx, dst)
+}
+
+func (c *Client) DialUDP(ctx context.Context, dst netip.AddrPort) (PacketConn, error) {
+	c.mu.Lock()
+	if c.writer == nil {
+		c.mu.Unlock()
+		return nil, ErrNotConnected
+	}
+
+	tc := c.tc
+	c.mu.Unlock()
+
+	return tc.DialUDP(ctx, dst)
 }
 
 func (c *Client) ID() string {

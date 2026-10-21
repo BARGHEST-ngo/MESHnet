@@ -1,6 +1,9 @@
 package meshnet
 
-import "errors"
+import (
+	"errors"
+	"net"
+)
 
 type State int
 
@@ -50,4 +53,9 @@ type ClientInfo struct {
 type Message struct {
 	Topic string //app-defined key
 	Data  []byte
+}
+
+type PacketConn interface {
+	net.Conn
+	net.PacketConn
 }
