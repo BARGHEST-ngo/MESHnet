@@ -92,3 +92,12 @@ srv.SetForwarding(clientID, true)
 
 // On the Client:
 conn, err := c.DialTCP(ctx, netip.MustParseAddrPort("93.184.215.14:443"))
+```
+
+## Pairing Clients
+1. The server starts and prints its `address`. Treat the address as a secret
+2. The app calls `NewPairing()` to create a 6-digit PIN which is valid for one Client
+3. Share the address and PIN over separate channels with at least one being end-to-end encrypted, such as Signal
+4. The client connects with both, a Client with only the server address cannot join.
+
+A PIN is single-use. Three wrong guesses cancel the pairing and a new PIN is required. 
