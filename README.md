@@ -1,6 +1,11 @@
 # MESHnet
 A small Go library that connects a server to its clients over an encrypted, peer-to-peer tunnel built on [tailcat](https://github.com/tailscale/tailcat). The server shares an address, the client joins with a one-time PIN, and from then on the two can exchange messages, open streams and, optionally, route the client's traffic out through the server.
 
+## Use Cases
+
+**Remote digital forensics**
+As a forensic analyst, I need to e
+
 ## Features
 
 - **PIN Pairing** Client access to the server is restricted behind PIN access, shared out-of-band. There are no accounts, no pre-shared key lists, and no coordination server to run.
