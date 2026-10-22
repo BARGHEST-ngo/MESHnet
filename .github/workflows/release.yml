@@ -33,10 +33,10 @@ jobs:
           mv build/meshnet.aar "$aar"
           sha256sum "$aar" > "$aar.sha256"
       - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 #v3.0.3
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            meshnet-${{ github.ref_name }}.aar
-            meshnet-${{ github.ref_name }}.aar.sha256
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "meshnet-${GITHUB_REF_NAME}.aar" "meshnet-${GITHUB_REF_NAME}.aar.sha256" \
+            --verify-tag --prerelease="$PRERELEASE"
