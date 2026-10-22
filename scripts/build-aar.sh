@@ -2,12 +2,12 @@
 # Builds the MESHnet Android AAR (package meshnetmobile) with gomobile.
 # Env overrides:
 #   ANDROID_HOME   Android SDK root (required)
-#   NDK_VERSION    NDK to build with (default: matches MESH build.gradle)
-#   ANDROID_API    minimum API level (default: 26, MESH minSdkVersion)
+#   NDK_VERSION    NDK to build with (default: r28: 16 KB page alignment required for API 35+ targets)
+#   ANDROID_API    minimum API level (default: 26)
 #   TARGET         gomobile target (default: android - all architectures)
 set -euo pipefail
 
-NDK_VERSION="${NDK_VERSION:-23.2.8568313}"
+NDK_VERSION="${NDK_VERSION:-28.2.13676358}"
 ANDROID_API="${ANDROID_API:-26}"
 TARGET="${TARGET:-android}"
 OUT="build/meshnet.aar"
