@@ -3,12 +3,6 @@ name: Transport Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - 'internal/transport/**'
-      - 'internal/protocol/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/transport-tests.yml'
   push:
     branches: [main]
 

@@ -3,11 +3,6 @@ name: Protocol Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - 'internal/protocol/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/protocol-tests.yml'
   push:
     branches: [main]
 
