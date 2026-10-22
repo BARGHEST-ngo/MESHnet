@@ -3,14 +3,6 @@ name: Mobile Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - 'mobile/**'
-      - 'internal/**'
-      - 'scripts/build-aar.sh'
-      - '*.go'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/mobile-tests.yml'
   push:
     branches: [main]
 
