@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android AAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race ./...
+      - name: Install NDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+      - name: Build AAR
+        run: scripts/build-aar.sh
+      - name: Package
+        run: |
+          aar="meshnet-${GITHUB_REF_NAME}.aar"
+          mv build/meshnet.aar "$aar"
+          sha256sum "$aar" > "$aar.sha256"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "meshnet-${GITHUB_REF_NAME}.aar" "meshnet-${GITHUB_REF_NAME}.aar.sha256" \
+            --verify-tag --prerelease="$PRERELEASE"
