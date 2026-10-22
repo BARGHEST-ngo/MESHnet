@@ -3,12 +3,6 @@ name: Core Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - '*.go'
-      - 'internal/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/core-tests.yml'
   push:
     branches: [main]
 
