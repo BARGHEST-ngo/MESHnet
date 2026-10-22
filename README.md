@@ -3,9 +3,23 @@ A small Go library that connects a server to its clients over an encrypted, peer
 
 ## Use Cases
 
-**Remote digital forensics**
-As a forensic analyst, I need to e
+**Remote digital forensics**  
+As a forensic analyst, I need to examine a phone that is in someone else's hands, possibly in another country  
 
+**Peer-to-peer file sharing**  
+As someone handling sensitive files, I need to send them directly to one trusted person over an encrypted tunnel, without uploading them to a cloud service first.  
+
+**Private one-to-one messaging**  
+As a small team or a pair of contacts, we need a direct, end-to-end encrypted channel for messages that leaves nothing behind when the session ends.  
+
+**Remote support**  
+As someone helping a colleague or relative, I need to reach a service running on their device, such as `adb`, without asking them to change router settings.
+
+**Trusted exit for a device**  
+As a traveller on hotel or conference Wi-Fi, I need my phone's traffic to leave through a machine I control, so that the local network sees only an encrypted tunnel.
+
+**Field device check-in**  
+As someone running devices in the field, I need them to report back and receive commands from my machine, with no inbound ports open at either end.
 ## Features
 
 - **PIN Pairing** Client access to the server is restricted behind PIN access, shared out-of-band. There are no accounts, no pre-shared key lists, and no coordination server to run.
