@@ -1,3 +1,5 @@
+>Note: MESHnet is currently early in development and subject to change. Consider this as pre-alpha
+
 # MESHnet
 A small Go library that connects a server to its clients over an encrypted, peer-to-peer tunnel built on [tailcat](https://github.com/tailscale/tailcat). The server shares an address, the client joins with a one-time PIN, and from then on the two can exchange messages, open streams and, optionally, route the client's traffic out through the server.
 
@@ -23,7 +25,7 @@ As someone running devices in the field, I need them to report back and receive 
 ## Features
 
 - **PIN Pairing** Client access to the server is restricted behind PIN access, shared out-of-band. There are no accounts, no pre-shared key lists, and no coordination server to run.
-- **Messagess** Small `{Topic, Data}` messages in both directions
+- **Messages** Small `{Topic, Data}` messages in both directions
 - **Streams** The server can request a client for a raw `net.Conn` for bulk transfer or for proxying a local service (for example `adb`).
 - **Forwarding** A paired client can send its TCP and UDP traffic out through the server's network
 - **Ephemeral** Nothing is persisted. The server gets a new key and address on every start, and a lost connection (intentional or not) is a finished session - a Client must reconnect from scratch with a new PIN
@@ -102,7 +104,7 @@ Network forwarding is disabled by default on the server and off per-client until
 
 ```go
 srv := meshnet.NewServer(meshnet.ServerConfig{
-    Foward: true,
+    Forward: true,
     //...
 })
 
