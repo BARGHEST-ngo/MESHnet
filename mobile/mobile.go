@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	meshnet "github.com/BARGHEST-ngo/MESHnet"
@@ -34,7 +35,9 @@ type Stream interface {
 const connectTimeout = 30 * time.Second
 
 type Client struct {
-	c *meshnet.Client
+	c   *meshnet.Client
+	mu  sync.Mutex
+	fwd *forwarder
 }
 
 func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.ClientConfig {
@@ -59,7 +62,17 @@ func clientConfig(serverAddr, pairingPIN, name string, l Listener) meshnet.Clien
 }
 
 func NewClient(serverAddr, pairingPIN, name string, l Listener) *Client {
-	return &Client{c: meshnet.NewClient(clientConfig(serverAddr, pairingPIN, name, l))}
+	mobileClient := &Client{}
+	cfg := clientConfig(serverAddr, pairingPIN, name, l)
+	appState := cfg.OnStateChange
+	cfg.OnStateChange = func(s meshnet.State, e error) {
+		if s == meshnet.StateDisconnected || s == meshnet.StateErrored {
+			mobileClient.StopForwarding()
+		}
+		appState(s, e)
+	}
+	mobileClient.c = meshnet.NewClient(cfg)
+	return mobileClient
 }
 
 func (c *Client) Connect() error {
