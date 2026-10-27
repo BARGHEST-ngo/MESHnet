@@ -18,6 +18,7 @@ import (
 
 func main() {
 	verbose := flag.Bool("v", false, "verbose logging (MESHnet and tailcat)")
+	fwd := flag.Bool("f", false, "forward client TCP & UDP traffic through the server")
 	flag.Parse()
 
 	var logf func(format string, args ...any)
@@ -36,8 +37,14 @@ func main() {
 		},
 		OnClientConnected: func(c meshnet.ClientInfo) {
 			log.Printf("client connected: %s (%s)", c.ID, c.Name)
+			if *fwd {
+				if err := srv.SetForwarding(c.ID, true); err != nil {
+					log.Printf("set forwarding: %v", err)
+				}
+			}
 			go streamDemo(srv, c.ID)
 		},
+		Forward: *fwd,
 	})
 
 	addr, err := srv.Start()
