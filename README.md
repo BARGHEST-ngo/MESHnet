@@ -21,23 +21,18 @@ MESHnet lets one device reach another with an address and a 6-digit PIN. It find
 - **Peer-to-peer.** Direct connections with NAT traversal, and a relay fallback when that fails. No open ports or router changes.
 - **End-to-end encrypted.** All traffic runs inside a WireGuard tunnel. Relays cannot read it.
 - **No control plane.** Unlike Tailscale, there are no accounts and no coordination server. Unlike plain WireGuard, there are no keys to copy or endpoints to configure.
+- **Works where UDP is blocked.** If UDP or WireGuard is blocked, for example by deep packet inspection, traffic falls back to the relay over HTTPS on port 443, still end-to-end encrypted.
 - **Ephemeral.** New keys every time the Authority starts. A PIN works once and expires after 10 minutes.
 
 ## Protocol
 
 MESHnet connects two devices with different roles: an **Authority** and a **Peer**. The Authority is one of the two devices, not a third-party server. The connection runs inside a WireGuard tunnel provided by [tailcat](https://github.com/tailscale/tailcat), which gives MESHnet Tailscale's data plane without Tailscale's control plane.
 
-```mermaid
-flowchart LR
-    A["Authority"] ===|"direct WireGuard tunnel"| P["Peer"]
-    A -.-|"bootstrap / fallback"| R(("DERP relay"))
-    R -.- P
-```
-
-1. The Authority starts and gets a fresh address that encodes its public key.
+1. The Authority starts with new keys and waits at a DERP relay. Its address holds its public keys and the relay to meet at. It does **not** contain the Authority's IP address, so a leaked address doesn't reveal where the device is.
 2. The Authority shares the address and a PIN with the Peer out of band, for example over Signal.
-3. The two set up the encrypted tunnel through a relay, then switch to a direct connection when NAT allows. If NAT doesn't allow it, traffic stays on the relay, still encrypted.
+3. The Peer meets the Authority at the relay, and the encrypted WireGuard tunnel comes up through it.
 4. Inside the tunnel, the Peer sends the PIN. The Authority checks it, and checks that the Peer's key matches the tunnel.
+5. In parallel, the two swap their IP:port endpoints over the relay and try UDP hole-punching. If it works, traffic moves to the direct path. If not, it stays on the relay, still encrypted.
 
 | | Authority | Peer |
 | --- | --- | --- |
@@ -50,7 +45,7 @@ flowchart LR
 
 In the Go API, the Authority is `meshnet.Server` and the Peer is `meshnet.Client`.
 
-**Limits to know:** three wrong PINs cancel a pairing, and an Authority accepts one Peer at a time. The address is the real secret, so share it like a password. Relays cannot read traffic, but they can see IP addresses, timing and data volume. MESHnet is not an anonymity tool.
+**Limits to know:** three wrong PINs cancel a pairing, and an Authority accepts one Peer at a time. The address is the real secret, so share it like a password. Relays cannot read traffic, but they can see IP addresses, timing and data volume. Once connected, each device can learn the other's IP address. MESHnet is not an anonymity tool.
 
 ## Getting started
 
