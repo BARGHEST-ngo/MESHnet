@@ -1,30 +1,43 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/meshnet-dark.png">
-  <img src="assets/meshnet-light.png" alt="MESHnet" width="360">
+  <source width="250" srcset="assets/meshnet-dark.png" media="(prefers-color-scheme: dark)" />
+  <source width="250" srcset="assets/meshnet-light.png" media="(prefers-color-scheme: light)" />
+  <img width="250" src="assets/meshnet-light.png" alt="MESHnet" />
 </picture>
 
-**An open protocol for peer-to-peer, end-to-end encrypted connections between devices. No accounts, no control plane, a fresh session every time.**
+[Protocol](#protocol) | [Getting started](#getting-started) | [Usage](#usage) | [License](#license) | [Contribution](#contribution)
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/BARGHEST-ngo/MESHnet.svg)](https://pkg.go.dev/github.com/BARGHEST-ngo/MESHnet)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 ![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)
 
-> **Pre-alpha.** The API and wire protocol will change. MESHnet has not had an independent security audit.
+**An open protocol for peer-to-peer, end-to-end encrypted connections between devices**
+
+MESHnet lets one device reach another with an address and a 6-digit PIN. It finds the best path between the two, wherever they are, and keeps the connection encrypted end to end inside a WireGuard tunnel. There are no accounts and no control plane, and the server gets new keys every time it starts. MESHnet is a Go library with an Android client, and it already powers [MESHdrop](https://github.com/BARGHEST-ngo/MESHdrop) for private file transfer, with [MESHforensics](https://github.com/BARGHEST-ngo/MESHforensics) integration in progress.
+
+>_Note: MESHnet is pre-alpha. The API and wire protocol will change, and it has not yet had an independent security audit._
 
 ## What is MESHnet?
-
-MESHnet lets one device reach another with an **address** and a **6-digit PIN**. It finds the best path between the two, wherever they are, and keeps the connection encrypted end to end.
 
 - **Peer-to-peer.** Direct connections with NAT traversal, and a relay fallback when that fails. No open ports or router changes.
 - **End-to-end encrypted.** All traffic runs inside a WireGuard tunnel. Relays cannot read it.
 - **No control plane.** Unlike Tailscale, there are no accounts and no coordination server. Unlike plain WireGuard, there are no keys to copy or endpoints to configure.
 - **Ephemeral.** New keys on every server start. A PIN works once and expires after 10 minutes.
 
-Built on MESHnet: [MESHdrop](https://github.com/BARGHEST-ngo/MESHdrop) (private file transfer) and [MESHforensics](https://github.com/BARGHEST-ngo/MESHforensics) (remote mobile forensics, integration in progress).
-
 ## Protocol
 
 MESHnet is a small session protocol that runs inside a WireGuard tunnel provided by [tailcat](https://github.com/tailscale/tailcat), which gives it Tailscale's data plane without Tailscale's control plane.
+
+```mermaid
+sequenceDiagram
+    participant S as Server
+    participant R as Relay
+    participant C as Client
+    S-->>C: address + PIN (shared out of band)
+    C->>R: connect
+    R->>S: bootstrap encrypted tunnel
+    C->>S: PIN check, inside the tunnel
+    C-->>S: direct path when NAT allows
+```
 
 1. The server starts and gets a fresh address that encodes its public key.
 2. The address and a PIN are shared with the client out of band, for example over Signal.
