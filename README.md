@@ -12,7 +12,7 @@
 
 **An open protocol for peer-to-peer, end-to-end encrypted connections between devices**
 
-MESHnet lets one device reach another with an address and a 6-digit PIN. It finds the best path between the two, wherever they are, and keeps the connection encrypted end to end inside a WireGuard tunnel. There are no accounts and no control plane, and the server gets new keys every time it starts. MESHnet is a Go library with an Android client, and it already powers [MESHdrop](https://github.com/BARGHEST-ngo/MESHdrop) for private file transfer, with [MESHforensics](https://github.com/BARGHEST-ngo/MESHforensics) integration in progress.
+MESHnet lets one device reach another with an address and a 6-digit PIN. It finds the best path between the two, wherever they are, and keeps the connection encrypted end to end inside a WireGuard tunnel. There are no accounts and no control plane, and the Authority gets new keys every time it starts. MESHnet is a Go library with an Android client, and it already powers [MESHdrop](https://github.com/BARGHEST-ngo/MESHdrop) for private file transfer, with [MESHforensics](https://github.com/BARGHEST-ngo/MESHforensics) integration in progress.
 
 >_Note: MESHnet is pre-alpha. The API and wire protocol will change, and it has not yet had an independent security audit._
 
@@ -21,32 +21,36 @@ MESHnet lets one device reach another with an address and a 6-digit PIN. It find
 - **Peer-to-peer.** Direct connections with NAT traversal, and a relay fallback when that fails. No open ports or router changes.
 - **End-to-end encrypted.** All traffic runs inside a WireGuard tunnel. Relays cannot read it.
 - **No control plane.** Unlike Tailscale, there are no accounts and no coordination server. Unlike plain WireGuard, there are no keys to copy or endpoints to configure.
-- **Ephemeral.** New keys on every server start. A PIN works once and expires after 10 minutes.
+- **Ephemeral.** New keys every time the Authority starts. A PIN works once and expires after 10 minutes.
 
 ## Protocol
 
-MESHnet is a small session protocol that runs inside a WireGuard tunnel provided by [tailcat](https://github.com/tailscale/tailcat), which gives it Tailscale's data plane without Tailscale's control plane.
+MESHnet connects two devices with different roles: an **Authority** and a **Peer**. The Authority is one of the two devices, not a third-party server. The connection runs inside a WireGuard tunnel provided by [tailcat](https://github.com/tailscale/tailcat), which gives MESHnet Tailscale's data plane without Tailscale's control plane.
 
 ```mermaid
-sequenceDiagram
-    participant S as Server
-    participant R as Relay
-    participant C as Client
-    S-->>C: address + PIN (shared out of band)
-    C->>R: connect
-    R->>S: bootstrap encrypted tunnel
-    C->>S: PIN check, inside the tunnel
-    C-->>S: direct path when NAT allows
+flowchart LR
+    A["Authority"] ===|"direct WireGuard tunnel"| P["Peer"]
+    A -.-|"bootstrap / fallback"| R(("DERP relay"))
+    R -.- P
 ```
 
-1. The server starts and gets a fresh address that encodes its public key.
-2. The address and a PIN are shared with the client out of band, for example over Signal.
-3. The client connects. The tunnel is bootstrapped through a DERP relay, then upgrades to a direct connection when NAT allows.
-4. Inside the tunnel, the client sends its PIN. The server checks it, and checks that the client's key matches the tunnel peer.
+1. The Authority starts and gets a fresh address that encodes its public key.
+2. The Authority shares the address and a PIN with the Peer out of band, for example over Signal.
+3. The two set up the encrypted tunnel through a relay, then switch to a direct connection when NAT allows. If NAT doesn't allow it, traffic stays on the relay, still encrypted.
+4. Inside the tunnel, the Peer sends the PIN. The Authority checks it, and checks that the Peer's key matches the tunnel.
 
-On top of the tunnel, apps get **messages** (`{Topic, Data}` in both directions), **streams** (raw `net.Conn` pipes, for example to proxy `adb`) and **forwarding** (the client's TCP and UDP traffic exits through the server).
+| | Authority | Peer |
+| --- | --- | --- |
+| Keys and address | New on every start | New for every session |
+| Admission | Issues and checks PINs, can disconnect the Peer | Presents the PIN |
+| Messages | Sends and receives `{Topic, Data}` | Sends and receives `{Topic, Data}` |
+| Streams | Requests raw `net.Conn` pipes by name, for example `adb` | Accepts or refuses each request |
+| Forwarding | Grants it per Peer, off by default | Sends TCP and UDP traffic out through the Authority |
+| Session | Ends when the Authority stops | Can leave at any time |
 
-**Limits to know:** three wrong PINs cancel a pairing, and a server accepts one client at a time. The address is the real secret, so share it like a password. Relays cannot read traffic, but they can see IP addresses, timing and data volume. MESHnet is not an anonymity tool.
+In the Go API, the Authority is `meshnet.Server` and the Peer is `meshnet.Client`.
+
+**Limits to know:** three wrong PINs cancel a pairing, and an Authority accepts one Peer at a time. The address is the real secret, so share it like a password. Relays cannot read traffic, but they can see IP addresses, timing and data volume. MESHnet is not an anonymity tool.
 
 ## Getting started
 
@@ -56,7 +60,7 @@ Requires Go 1.27.1 or later.
 go get github.com/BARGHEST-ngo/MESHnet
 ```
 
-For Android, a client AAR (`meshnetmobile`) is attached to each [release](https://github.com/BARGHEST-ngo/MESHnet/releases).
+For Android, an AAR (`meshnetmobile`, Peer role only) is attached to each [release](https://github.com/BARGHEST-ngo/MESHnet/releases).
 
 Try the examples on two machines:
 
@@ -70,7 +74,7 @@ $ go run ./examples/client -addr 'tcomFwWCCcjS5nKNqAod034nWoJZ...' -pin 482913
 
 ## Usage
 
-**Server**
+**Authority (`Server`)**
 
 ```go
 srv := meshnet.NewServer(meshnet.ServerConfig{
@@ -91,7 +95,7 @@ log.Printf("address: %s PIN: %s", addr, pin)
 <-srv.Done()
 ```
 
-**Client**
+**Peer (`Client`)**
 
 ```go
 c := meshnet.NewClient(meshnet.ClientConfig{
