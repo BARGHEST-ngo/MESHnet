@@ -8,7 +8,7 @@ A small Go library that connects a server to its clients over an encrypted, peer
 **Remote digital forensics**  
 As a forensic analyst, I need to examine a phone that is in someone else's hands, possibly in another country  
 
-**Peer-to-peer file sharing**  
+**[Peer-to-peer file sharing](https://github.com/BARGHEST-ngo/MESHdrop)**  
 As someone handling sensitive files, I need to send them directly to one trusted person over an encrypted tunnel, without uploading them to a cloud service first.  
 
 **Private one-to-one messaging**  
