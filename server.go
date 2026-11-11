@@ -725,14 +725,14 @@ func (s *Server) handleForwardUDP(conn tailcat.ConnPacketConn, dst netip.AddrPor
 }
 
 func (s *Server) forwardTCP(dst netip.AddrPort) func(net.Conn) {
-	if !allowedDestination(dst) {
+	if !allowedDestination(dst) || !hasRoute(dst) {
 		return nil
 	}
 	return func(conn net.Conn) { s.handleForwardTCP(conn, dst) }
 }
 
 func (s *Server) forwardUDP(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
-	if !allowedDestination(dst) {
+	if !allowedDestination(dst) || !hasRoute(dst) {
 		return nil
 	}
 
@@ -864,4 +864,14 @@ func (s *Server) clearSession(sess *session) {
 	if srv != nil {
 		srv.DisconnectClient(sess.key)
 	}
+}
+
+// hasRoute reports whether the server's OS has a route to dst.
+func hasRoute(dst netip.AddrPort) bool {
+	c, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }
