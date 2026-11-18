@@ -296,7 +296,13 @@ func (s *Server) DisconnectClient(clientID string) error {
 
 	s.mu.Lock()
 	sess.endReason = ErrDisconnectedByServer
+	w := sess.writer
 	s.mu.Unlock()
+
+	if err := sendClose(sess.conn, w); err != nil {
+		s.cfg.Logf("meshnet: client %s: send close: %v", clientID, err)
+	}
+
 	s.clearSession(sess)
 	sess.conn.Close()
 	return nil
@@ -319,7 +325,26 @@ func (s *Server) Stop() error {
 	s.sessions = nil
 	s.pairing = nil
 	s.err = ErrClosed
+
+	writers := make(map[*session]*transport.Writer, len(sessions))
+	for _, sess := range sessions {
+		writers[sess] = sess.writer
+	}
 	s.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for sess, w := range writers {
+		if w == nil {
+			continue
+		}
+
+		wg.Go(func() {
+			if err := sendClose(sess.conn, w); err != nil {
+				s.cfg.Logf("meshnet: client %s: send close: %v", sess.clientInfo.ID, err)
+			}
+		})
+	}
+	wg.Wait()
 
 	for _, sess := range sessions {
 		sess.conn.Close()

@@ -555,16 +555,45 @@ func TestServerStopEndsSession(t *testing.T) {
 	s, fake := startNewTestServer(t)
 	conn, _, done := connectClient(t, s, fake)
 
-	start := time.Now()
-	if err := s.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- s.Stop()
+	}()
+
+	f, err := protocol.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("ReadFrameL: %v", err)
 	}
+	if f.Kind != protocol.KindClose {
+		t.Fatalf("got %v frame, want Close", f.Kind)
+	}
+
+	var cl protocol.Close
+	if err := cl.UnmarshalBinary(f.Payload); err != nil {
+		t.Fatalf("close payload: %v", err)
+	}
+	if cl.Err != protocol.CloseErrNone {
+		t.Errorf("Close reason %v, want %v", cl.Err, protocol.CloseErrNone)
+	}
+
+	start := time.Now()
 	if _, err := protocol.ReadFrame(conn); err == nil {
 		t.Fatal("ReadFrame succeeded after Stop")
 	}
+
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("client noticed after %v: Stop didn't close the session's conn", elapsed)
 	}
+
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stop did not return")
+	}
+
 	assertClosed(t, done)
 }
 

@@ -294,6 +294,59 @@ func TestFinishFlushesQueue(t *testing.T) {
 	}
 }
 
+func TestFinishRejectsEnqueue(t *testing.T) {
+	pipeWriter, pipeReader := pipe(t)
+	w := NewWriter(pipeWriter)
+	defer w.Close()
+
+	if err := w.Enqueue(frame(0)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	last := protocol.Frame{Kind: protocol.KindClose, Payload: []byte{0}}
+	finished := make(chan error, 1)
+	go func() {
+		finished <- w.Finish(last)
+	}()
+
+	// Wait for Finish to mark the writer as finishing
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		w.mu.Lock()
+		finishing := w.finishing
+		w.mu.Unlock()
+		if finishing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Finish did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := w.Enqueue(frame(1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Enqueue while finishing = %v, want ErrClosed", err)
+	}
+
+	f, err := protocol.ReadFrame(pipeReader)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if f.Kind != protocol.KindMsg {
+		t.Errorf("first frame kind = %v, want Msg", f.Kind)
+	}
+	f, err = protocol.ReadFrame(pipeReader)
+	if err != nil {
+		t.Fatalf("ReadFrame last: %v", err)
+	}
+	if f.Kind != protocol.KindClose {
+		t.Errorf("last frame kind = %v, want Close", f.Kind)
+	}
+	if err := <-finished; err != nil {
+		t.Errorf("Finish = %v, want nil", err)
+	}
+}
+
 func TestFinishAfterClose(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)

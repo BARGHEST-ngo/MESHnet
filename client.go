@@ -139,9 +139,16 @@ func (c *Client) Disconnect() error {
 		c.mu.Unlock()
 		return nil
 	}
+	conn := c.conn
+	w := c.writer
 	c.mu.Unlock()
 
 	c.setState(StateDisconnecting, nil)
+	if w != nil {
+		if err := sendClose(conn, w); err != nil {
+			c.cfg.Logf("meshnet: send close: %v", err)
+		}
+	}
 	c.finish(StateDisconnected, nil)
 	return nil
 }
