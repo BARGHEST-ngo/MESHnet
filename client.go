@@ -29,14 +29,15 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	mu       sync.Mutex // guards all to the line break
-	tc       tailcatClient
-	conn     net.Conn
-	used     bool // Connect has been called, Clients are single-use
-	writer   *transport.Writer
-	state    State
-	finished bool // final state has been reported, set once
-	streams  []net.Conn
+	mu            sync.Mutex // guards all to the line break
+	tc            tailcatClient
+	conn          net.Conn
+	used          bool // Connect has been called, Clients are single-use
+	writer        *transport.Writer
+	state         State
+	finished      bool // final state has been reported, set once
+	streams       []net.Conn
+	disconnecting bool
 
 	cfg             ClientConfig
 	newTailcat      func(cfg ClientConfig) tailcatClient
@@ -139,9 +140,17 @@ func (c *Client) Disconnect() error {
 		c.mu.Unlock()
 		return nil
 	}
+	c.disconnecting = true
+	conn := c.conn
+	w := c.writer
 	c.mu.Unlock()
 
 	c.setState(StateDisconnecting, nil)
+	if w != nil {
+		if err := sendClose(conn, w); err != nil {
+			c.cfg.Logf("meshnet: send close: %v", err)
+		}
+	}
 	c.finish(StateDisconnected, nil)
 	return nil
 }
@@ -265,6 +274,12 @@ func (c *Client) handshake(ctx context.Context, conn net.Conn, key string) error
 func (c *Client) readLoop(conn net.Conn) {
 	cause := c.serve(conn)
 
+	c.mu.Lock()
+	disconnecting := c.disconnecting
+	c.mu.Unlock()
+	if disconnecting {
+		return
+	}
 	if errors.Is(cause, ErrServerClosed) {
 		c.cfg.Logf("meshnet: %v", cause)
 		c.finish(StateDisconnected, cause)

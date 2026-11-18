@@ -4,9 +4,15 @@
 package meshnet
 
 import (
+	"os"
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	closeTimeout = 100 * time.Millisecond
+	os.Exit(m.Run())
+}
 
 // next waits for one value from ch, failing the test after a timeout.
 func next[T any](t *testing.T, ch <-chan T) T {

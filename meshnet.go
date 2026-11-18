@@ -6,6 +6,10 @@ package meshnet
 import (
 	"errors"
 	"net"
+	"time"
+
+	"github.com/BARGHEST-ngo/MESHnet/internal/protocol"
+	"github.com/BARGHEST-ngo/MESHnet/internal/transport"
 )
 
 type State int
@@ -61,4 +65,16 @@ type Message struct {
 type PacketConn interface {
 	net.Conn
 	net.PacketConn
+}
+
+var closeTimeout = 2 * time.Second
+
+func sendClose(conn net.Conn, w *transport.Writer) error {
+	payload, err := protocol.Close{}.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(closeTimeout))
+	return w.Finish(protocol.Frame{Kind: protocol.KindClose, Payload: payload})
 }
