@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -253,4 +254,78 @@ func TestWriterDone(t *testing.T) {
 			t.Fatal("Done still open after a write error")
 		}
 	})
+}
+
+func TestFinishFlushesQueue(t *testing.T) {
+	pipeWriter, pipeReader := pipe(t)
+	w := NewWriter(pipeWriter)
+	defer w.Close()
+
+	for i := range 3 {
+		if err := w.Enqueue(frame(i)); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	last := protocol.Frame{Kind: protocol.KindClose, Payload: []byte{0}}
+	finished := make(chan error, 1)
+	go func() {
+		finished <- w.Finish(last)
+	}()
+
+	for i := range 3 {
+		f, err := protocol.ReadFrame(pipeReader)
+		if err != nil {
+			t.Fatalf("ReadFrame %d: %v", i, err)
+		}
+		if got := int(binary.BigEndian.Uint16(f.Payload)); got != i {
+			t.Errorf("frame %d: got sequence %d", i, got)
+		}
+	}
+	f, err := protocol.ReadFrame(pipeReader)
+	if err != nil {
+		t.Fatalf("ReadFrame last: %v", err)
+	}
+	if f.Kind != protocol.KindClose {
+		t.Errorf("last frame kind = %v, want Close", f.Kind)
+	}
+	if err := <-finished; err != nil {
+		t.Errorf("Finish = %v, want nil", err)
+	}
+}
+
+func TestFinishAfterClose(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.Close()
+
+	last := protocol.Frame{Kind: protocol.KindClose, Payload: []byte{0}}
+	if err := w.Finish(last); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Finish after Close = %v, want ErrClosed", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("wrote %d bytes after Close, want 0", buf.Len())
+	}
+}
+
+func TestFinishTwice(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	defer w.Close()
+
+	last := protocol.Frame{Kind: protocol.KindClose, Payload: []byte{0}}
+	if err := w.Finish(last); err != nil {
+		t.Fatalf("first Finish: %v", err)
+	}
+
+	finished := make(chan error, 1)
+	go func() { finished <- w.Finish(last) }()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("second Finish = %v, want ErrClosed", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second Finish blocked")
+	}
 }
