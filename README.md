@@ -49,7 +49,7 @@ In the Go API, the Authority is `meshnet.Server` and the Peer is `meshnet.Client
 
 ## Getting started
 
-Requires Go 1.27.1 or later.
+Requires Go 1.27.4 or later.
 
 ```sh
 go get github.com/BARGHEST-ngo/MESHnet
