@@ -13,6 +13,12 @@ TARGET="${TARGET:-android}"
 OUT="build/meshnet.aar"
 
 cd "$(dirname "$0")/.."
+
+# gomobile records the absolute source path in the AAR's build info. 
+# Build via a fixed path so the output does not depend on where the repo is checked out.
+SRC_LINK=/tmp/meshnet-src
+ln -sfn "$PWD" "$SRC_LINK"
+cd "$SRC_LINK"
 : "${ANDROID_HOME:?ANDROID_HOME must point at the Android SDK}"
 
 # Prefer the pinned NDK over any inherited ANDROID_NDK_HOME:
@@ -37,7 +43,7 @@ gomobile bind \
 	-androidapi "$ANDROID_API" \
 	-javapkg org.barghest.meshnet \
 	-trimpath \
-	-ldflags "-s -w" \
+	-ldflags "-s -w -buildid=" \
 	-o "$OUT" \
 	./mobile
 
