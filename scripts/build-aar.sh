@@ -15,7 +15,7 @@ OUT="build/meshnet.aar"
 cd "$(dirname "$0")/.."
 : "${ANDROID_HOME:?ANDROID_HOME must point at the Android SDK}"
 
-# Prefer the pinned NDK over any inherited ANDROID_NDK_HOME: 
+# Prefer the pinned NDK over any inherited ANDROID_NDK_HOME:
 # CI runners preset it to their default NDK, which silently overrode NDK_VERSION.
 if [[ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]]; then
 	export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
@@ -40,14 +40,16 @@ gomobile bind \
 	-ldflags "-s -w" \
 	-o "$OUT" \
 	./mobile
-	
+
 # Google Play requires 16 KB-aligned LOAD segments on 64-bit ABIs (API 35+ targets).
 readelf="$(echo "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf)"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 unzip -q "$OUT" 'jni/*' -d "$tmp"
+shopt -s nullglob
 for so in "$tmp"/jni/{arm64-v8a,x86_64}/*.so; do
-	if "$readelf" -lW "$so" | awk '/LOAD/ && $NF != "0x4000" {bad=1} END {exit !bad}'; then
-		echo "$(basename "$(dirname "$so")")/$(basename "$so") is not 16 KB aligned" >&2
+	align="$("$readelf" -lW "$so" | awk '/LOAD/ {print $NF}' | sort -u)"
+	if [[ "$align" != "0x4000" ]]; then
+		echo "$(basename "$(dirname "$so")")/$(basename "$so") is not 16 KB aligned (LOAD align: ${align:-none})" >&2
 		exit 1
 	fi
 done
